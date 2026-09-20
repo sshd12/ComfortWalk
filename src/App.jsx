@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState
 } from 'react'
@@ -9,17 +10,25 @@ import * as maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import './App.css'
 
-const METERS_PER_MILE =
-  1609.344
+const METERS_PER_MILE = 1609.344
 
-const ROUTE_SOURCE =
-  'walking-route'
+const ALL_ROUTES_SOURCE_ID =
+  'all-walking-routes'
 
-const ROUTE_OUTLINE =
-  'walking-route-outline'
+const ALL_ROUTES_OUTLINE_ID =
+  'all-walking-routes-outline'
 
-const ROUTE_LINE =
-  'walking-route-line'
+const ALL_ROUTES_LINE_ID =
+  'all-walking-routes-line'
+
+const SELECTED_ROUTE_SOURCE_ID =
+  'selected-walking-route'
+
+const SELECTED_ROUTE_OUTLINE_ID =
+  'selected-walking-route-outline'
+
+const SELECTED_ROUTE_LINE_ID =
+  'selected-walking-route-line'
 
 // ============================================================
 // HELPERS
@@ -31,7 +40,7 @@ function haversineMeters(
   lon2,
   lat2
 ) {
-  const R =
+  const earthRadius =
     6371000
 
   const toRadians =
@@ -40,35 +49,35 @@ function haversineMeters(
       Math.PI /
       180
 
-  const p1 =
+  const phi1 =
     toRadians(lat1)
 
-  const p2 =
+  const phi2 =
     toRadians(lat2)
 
-  const dLat =
+  const deltaLatitude =
     toRadians(
       lat2 - lat1
     )
 
-  const dLon =
+  const deltaLongitude =
     toRadians(
       lon2 - lon1
     )
 
   const a =
     Math.sin(
-      dLat / 2
+      deltaLatitude / 2
     ) ** 2 +
-    Math.cos(p1) *
-    Math.cos(p2) *
+    Math.cos(phi1) *
+    Math.cos(phi2) *
     Math.sin(
-      dLon / 2
+      deltaLongitude / 2
     ) ** 2
 
   return (
     2 *
-    R *
+    earthRadius *
     Math.atan2(
       Math.sqrt(a),
       Math.sqrt(1 - a)
@@ -92,13 +101,11 @@ function formatSearchDistance(
     METERS_PER_MILE
 
   if (
-    miles <
-    0.1
+    miles < 0.1
   ) {
     return (
       `${Math.round(
-        meters *
-        3.28084
+        meters * 3.28084
       )} ft`
     )
   }
@@ -112,35 +119,229 @@ function formatTime(
   minutes
 ) {
   const value =
-    Math.round(
-      Number(minutes)
-    )
+    Number(minutes)
 
   if (
-    value <
-    60
+    !Number.isFinite(
+      value
+    )
+  ) {
+    return ''
+  }
+
+  const rounded =
+    Math.round(value)
+
+  if (
+    rounded < 60
   ) {
     return (
-      `${value} min`
+      `${rounded} min`
     )
   }
 
   const hours =
     Math.floor(
-      value /
-      60
+      rounded / 60
     )
 
   const remaining =
-    value %
-    60
+    rounded % 60
+
+  if (
+    remaining === 0
+  ) {
+    return (
+      `${hours} hr`
+    )
+  }
 
   return (
-    remaining ===
-      0
-      ? `${hours} hr`
-      : `${hours} hr ${remaining} min`
+    `${hours} hr ${remaining} min`
   )
+}
+
+function getRoutePurpose(
+  routeId
+) {
+  if (
+    routeId === 'shortest'
+  ) {
+    return 'Minimum distance'
+  }
+
+  if (
+    routeId === 'balanced'
+  ) {
+    return 'Distance + effort'
+  }
+
+  return 'Minimum modeled energy'
+}
+
+function getSameRouteText(
+  route
+) {
+  if (
+    route.samePathAs ===
+    'shortest'
+  ) {
+    return 'Same path as Shortest'
+  }
+
+  if (
+    route.samePathAs ===
+    'balanced'
+  ) {
+    return 'Same path as Balanced'
+  }
+
+  return ''
+}
+
+function getTradeoffText(
+  route,
+  shortest
+) {
+  if (
+    !route ||
+    !shortest
+  ) {
+    return ''
+  }
+
+  if (
+    route.id === 'shortest'
+  ) {
+    return 'Baseline route'
+  }
+
+  const timeDifference =
+    Number(route.minutes) -
+    Number(shortest.minutes)
+
+  const ascentDifference =
+    Number(
+      route.totalAscentMeters
+    ) -
+    Number(
+      shortest.totalAscentMeters
+    )
+
+  let energyDifferencePercent = 0
+
+  if (
+    Number(
+      shortest.energyKJPerKg
+    ) > 0
+  ) {
+    energyDifferencePercent =
+      (
+        (
+          Number(
+            route.energyKJPerKg
+          ) -
+          Number(
+            shortest.energyKJPerKg
+          )
+        ) /
+        Number(
+          shortest.energyKJPerKg
+        )
+      ) *
+      100
+  }
+
+  let timeText
+
+  if (
+    Math.abs(
+      timeDifference
+    ) < 0.05
+  ) {
+    timeText =
+      'same time'
+  } else {
+    timeText =
+      `${
+        timeDifference >= 0
+          ? '+'
+          : '−'
+      }${Math.abs(
+        timeDifference
+      ).toFixed(1)} min`
+  }
+
+  let ascentText
+
+  if (
+    Math.abs(
+      ascentDifference
+    ) < 0.5
+  ) {
+    ascentText =
+      'same climb'
+  } else {
+    ascentText =
+      `${
+        ascentDifference < 0
+          ? '−'
+          : '+'
+      }${Math.round(
+        Math.abs(
+          ascentDifference
+        )
+      )} m climb`
+  }
+
+  let energyText
+
+  if (
+    Math.abs(
+      energyDifferencePercent
+    ) < 0.1
+  ) {
+    energyText =
+      'same energy'
+  } else {
+    energyText =
+      `${
+        energyDifferencePercent < 0
+          ? '−'
+          : '+'
+      }${Math.abs(
+        energyDifferencePercent
+      ).toFixed(1)}% energy`
+  }
+
+  return (
+    `${timeText} · ${ascentText} · ${energyText}`
+  )
+}
+
+function routeToFeature(
+  route
+) {
+  return {
+    type:
+      'Feature',
+
+    properties: {
+      id:
+        route.id,
+
+      label:
+        route.label
+    },
+
+    geometry: {
+      type:
+        'LineString',
+
+      coordinates:
+        route.coordinates
+    }
+  }
 }
 
 // ============================================================
@@ -148,7 +349,7 @@ function formatTime(
 // ============================================================
 
 function App() {
-  const mapElementRef =
+  const mapContainerRef =
     useRef(null)
 
   const mapRef =
@@ -160,26 +361,26 @@ function App() {
   const destinationMarkerRef =
     useRef(null)
 
-  const locationRef =
+  const currentLocationRef =
     useRef(null)
 
   const watchIdRef =
     useRef(null)
 
-  const centeredRef =
-    useRef(false)
-
-  const searchAbortRef =
-    useRef(null)
-
-  const searchRequestRef =
-    useRef(0)
-
-  const searchLockedRef =
+  const hasCenteredRef =
     useRef(false)
 
   const pendingDestinationRef =
     useRef(null)
+
+  const searchAbortControllerRef =
+    useRef(null)
+
+  const searchRequestIdRef =
+    useRef(0)
+
+  const searchLockedRef =
+    useRef(false)
 
   const [
     search,
@@ -188,14 +389,14 @@ function App() {
     useState('')
 
   const [
-    results,
-    setResults
+    searchResults,
+    setSearchResults
   ] =
     useState([])
 
   const [
-    searching,
-    setSearching
+    searchLoading,
+    setSearchLoading
   ] =
     useState(false)
 
@@ -206,10 +407,18 @@ function App() {
     useState(null)
 
   const [
-    route,
-    setRoute
+    routes,
+    setRoutes
   ] =
-    useState(null)
+    useState([])
+
+  const [
+    selectedRouteId,
+    setSelectedRouteId
+  ] =
+    useState(
+      'shortest'
+    )
 
   const [
     routeLoading,
@@ -218,16 +427,53 @@ function App() {
     useState(false)
 
   const [
-    navigation,
-    setNavigation
+    navigationStarted,
+    setNavigationStarted
   ] =
     useState(false)
 
   const [
-    error,
-    setError
+    errorMessage,
+    setErrorMessage
   ] =
     useState('')
+
+  const selectedRoute =
+    useMemo(
+      () => {
+        return (
+          routes.find(
+            route =>
+              route.id ===
+              selectedRouteId
+          ) ||
+          routes[0] ||
+          null
+        )
+      },
+      [
+        routes,
+        selectedRouteId
+      ]
+    )
+
+  const shortestRoute =
+    useMemo(
+      () => {
+        return (
+          routes.find(
+            route =>
+              route.id ===
+              'shortest'
+          ) ||
+          routes[0] ||
+          null
+        )
+      },
+      [
+        routes
+      ]
+    )
 
   // ============================================================
   // MAP
@@ -236,7 +482,7 @@ function App() {
   useEffect(
     () => {
       if (
-        !mapElementRef.current
+        !mapContainerRef.current
       ) {
         return
       }
@@ -244,11 +490,10 @@ function App() {
       const map =
         new maplibregl.Map({
           container:
-            mapElementRef.current,
+            mapContainerRef.current,
 
           style: {
-            version:
-              8,
+            version: 8,
 
             sources: {
               osm: {
@@ -259,8 +504,7 @@ function App() {
                   'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
                 ],
 
-                tileSize:
-                  256,
+                tileSize: 256,
 
                 attribution:
                   '© OpenStreetMap contributors'
@@ -286,8 +530,7 @@ function App() {
             37.7749
           ],
 
-          zoom:
-            13
+          zoom: 13
         })
 
       mapRef.current =
@@ -305,20 +548,24 @@ function App() {
           watchIdRef.current !==
           null
         ) {
-          navigator.geolocation
+          navigator
+            .geolocation
             .clearWatch(
               watchIdRef.current
             )
         }
 
         map.remove()
+
+        mapRef.current =
+          null
       }
     },
     []
   )
 
   // ============================================================
-  // ROUTE LAYER
+  // ROUTE MAP LAYERS
   // ============================================================
 
   function createRouteLayers() {
@@ -329,16 +576,16 @@ function App() {
       !map ||
       !map.isStyleLoaded()
     ) {
-      return
+      return false
     }
 
     if (
       !map.getSource(
-        ROUTE_SOURCE
+        ALL_ROUTES_SOURCE_ID
       )
     ) {
       map.addSource(
-        ROUTE_SOURCE,
+        ALL_ROUTES_SOURCE_ID,
         {
           type:
             'geojson',
@@ -347,8 +594,7 @@ function App() {
             type:
               'FeatureCollection',
 
-            features:
-              []
+            features: []
           }
         }
       )
@@ -356,18 +602,127 @@ function App() {
 
     if (
       !map.getLayer(
-        ROUTE_OUTLINE
+        ALL_ROUTES_OUTLINE_ID
       )
     ) {
       map.addLayer({
         id:
-          ROUTE_OUTLINE,
+          ALL_ROUTES_OUTLINE_ID,
 
         type:
           'line',
 
         source:
-          ROUTE_SOURCE,
+          ALL_ROUTES_SOURCE_ID,
+
+        layout: {
+          'line-cap':
+            'round',
+
+          'line-join':
+            'round'
+        },
+
+        paint: {
+          'line-color':
+            '#ffffff',
+
+          'line-width':
+            9,
+
+          'line-opacity':
+            0.55
+        }
+      })
+    }
+
+    if (
+      !map.getLayer(
+        ALL_ROUTES_LINE_ID
+      )
+    ) {
+      map.addLayer({
+        id:
+          ALL_ROUTES_LINE_ID,
+
+        type:
+          'line',
+
+        source:
+          ALL_ROUTES_SOURCE_ID,
+
+        layout: {
+          'line-cap':
+            'round',
+
+          'line-join':
+            'round'
+        },
+
+        paint: {
+          'line-color': [
+            'match',
+            [
+              'get',
+              'id'
+            ],
+
+            'shortest',
+            '#4A9BFF',
+
+            'balanced',
+            '#8B72FF',
+
+            'energy',
+            '#42B98C',
+
+            '#80AFFF'
+          ],
+
+          'line-width':
+            5,
+
+          'line-opacity':
+            0.34
+        }
+      })
+    }
+
+    if (
+      !map.getSource(
+        SELECTED_ROUTE_SOURCE_ID
+      )
+    ) {
+      map.addSource(
+        SELECTED_ROUTE_SOURCE_ID,
+        {
+          type:
+            'geojson',
+
+          data: {
+            type:
+              'FeatureCollection',
+
+            features: []
+          }
+        }
+      )
+    }
+
+    if (
+      !map.getLayer(
+        SELECTED_ROUTE_OUTLINE_ID
+      )
+    ) {
+      map.addLayer({
+        id:
+          SELECTED_ROUTE_OUTLINE_ID,
+
+        type:
+          'line',
+
+        source:
+          SELECTED_ROUTE_SOURCE_ID,
 
         layout: {
           'line-cap':
@@ -385,25 +740,25 @@ function App() {
             12,
 
           'line-opacity':
-            0.96
+            0.97
         }
       })
     }
 
     if (
       !map.getLayer(
-        ROUTE_LINE
+        SELECTED_ROUTE_LINE_ID
       )
     ) {
       map.addLayer({
         id:
-          ROUTE_LINE,
+          SELECTED_ROUTE_LINE_ID,
 
         type:
           'line',
 
         source:
-          ROUTE_SOURCE,
+          SELECTED_ROUTE_SOURCE_ID,
 
         layout: {
           'line-cap':
@@ -414,8 +769,24 @@ function App() {
         },
 
         paint: {
-          'line-color':
-            '#087bff',
+          'line-color': [
+            'match',
+            [
+              'get',
+              'id'
+            ],
+
+            'shortest',
+            '#087BFF',
+
+            'balanced',
+            '#7657FF',
+
+            'energy',
+            '#15966B',
+
+            '#087BFF'
+          ],
 
           'line-width':
             7,
@@ -425,17 +796,68 @@ function App() {
         }
       })
     }
+
+    return true
   }
 
-  function drawRoute(
-    routeData
+  // ============================================================
+  // ROUTE DRAWING
+  // ============================================================
+
+  function clearRouteDrawing() {
+    const map =
+      mapRef.current
+
+    if (
+      !map ||
+      !map.isStyleLoaded()
+    ) {
+      return
+    }
+
+    const allSource =
+      map.getSource(
+        ALL_ROUTES_SOURCE_ID
+      )
+
+    if (allSource) {
+      allSource.setData({
+        type:
+          'FeatureCollection',
+
+        features: []
+      })
+    }
+
+    const selectedSource =
+      map.getSource(
+        SELECTED_ROUTE_SOURCE_ID
+      )
+
+    if (selectedSource) {
+      selectedSource.setData({
+        type:
+          'FeatureCollection',
+
+        features: []
+      })
+    }
+  }
+
+  function drawRoutes(
+    allRoutes,
+    selected
   ) {
     const map =
       mapRef.current
 
     if (
       !map ||
-      !routeData
+      !Array.isArray(
+        allRoutes
+      ) ||
+      allRoutes.length === 0 ||
+      !selected
     ) {
       return
     }
@@ -445,10 +867,12 @@ function App() {
     ) {
       map.once(
         'load',
-        () =>
-          drawRoute(
-            routeData
+        () => {
+          drawRoutes(
+            allRoutes,
+            selected
           )
+        }
       )
 
       return
@@ -456,87 +880,77 @@ function App() {
 
     createRouteLayers()
 
-    const coordinates =
-      routeData.coordinates
-        .map(
-          coordinate => [
-            Number(
-              coordinate[0]
-            ),
-
-            Number(
-              coordinate[1]
-            )
-          ]
-        )
-        .filter(
-          coordinate =>
-            Number.isFinite(
-              coordinate[0]
-            ) &&
-            Number.isFinite(
-              coordinate[1]
-            )
-        )
-
-    const source =
-      map.getSource(
-        ROUTE_SOURCE
+    const validRoutes =
+      allRoutes.filter(
+        route =>
+          route &&
+          Array.isArray(
+            route.coordinates
+          ) &&
+          route.coordinates
+            .length >= 2
       )
 
-    source.setData({
-      type:
-        'Feature',
+    const allSource =
+      map.getSource(
+        ALL_ROUTES_SOURCE_ID
+      )
 
-      properties: {},
-
-      geometry: {
+    if (allSource) {
+      allSource.setData({
         type:
-          'LineString',
+          'FeatureCollection',
 
-        coordinates
-      }
-    })
+        features:
+          validRoutes.map(
+            route =>
+              routeToFeature(
+                route
+              )
+          )
+      })
+    }
+
+    const selectedSource =
+      map.getSource(
+        SELECTED_ROUTE_SOURCE_ID
+      )
+
+    if (
+      selectedSource &&
+      Array.isArray(
+        selected.coordinates
+      ) &&
+      selected.coordinates
+        .length >= 2
+    ) {
+      selectedSource.setData(
+        routeToFeature(
+          selected
+        )
+      )
+    }
 
     console.log(
       'ROUTE DRAWN:',
-      coordinates.length
+      selected.id,
+      selected.coordinates.length
     )
   }
 
-  function clearRoute() {
+  function fitRoute(
+    route
+  ) {
     const map =
       mapRef.current
 
     if (
       !map ||
-      !map.isStyleLoaded()
-    ) {
-      return
-    }
-
-    const source =
-      map.getSource(
-        ROUTE_SOURCE
+      !route ||
+      !Array.isArray(
+        route.coordinates
       )
-
-    if (source) {
-      source.setData({
-        type:
-          'FeatureCollection',
-
-        features: []
-      })
-    }
-  }
-
-  function fitRoute(
-    routeData
-  ) {
-    const map =
-      mapRef.current
-
-    if (!map) {
+    ) {
       return
     }
 
@@ -546,16 +960,41 @@ function App() {
 
     for (
       const coordinate
-      of routeData.coordinates
+      of route.coordinates
     ) {
-      bounds.extend([
+      if (
+        !Array.isArray(
+          coordinate
+        ) ||
+        coordinate.length < 2
+      ) {
+        continue
+      }
+
+      const longitude =
         Number(
           coordinate[0]
-        ),
+        )
 
+      const latitude =
         Number(
           coordinate[1]
         )
+
+      if (
+        !Number.isFinite(
+          longitude
+        ) ||
+        !Number.isFinite(
+          latitude
+        )
+      ) {
+        continue
+      }
+
+      bounds.extend([
+        longitude,
+        latitude
       ])
     }
 
@@ -569,24 +1008,18 @@ function App() {
       bounds,
       {
         padding: {
-          top:
-            110,
+          top: 115,
 
-          bottom:
-            190,
+          bottom: 300,
 
-          left:
-            55,
+          left: 55,
 
-          right:
-            55
+          right: 55
         },
 
-        maxZoom:
-          17,
+        maxZoom: 17,
 
-        duration:
-          700
+        duration: 650
       }
     )
   }
@@ -600,11 +1033,16 @@ function App() {
       if (
         !navigator.geolocation
       ) {
+        setErrorMessage(
+          'Location is not supported.'
+        )
+
         return
       }
 
       watchIdRef.current =
-        navigator.geolocation
+        navigator
+          .geolocation
           .watchPosition(
             position => {
               const location = {
@@ -614,14 +1052,10 @@ function App() {
 
                 latitude:
                   position.coords
-                    .latitude,
-
-                heading:
-                  position.coords
-                    .heading
+                    .latitude
               }
 
-              locationRef.current =
+              currentLocationRef.current =
                 location
 
               updateCurrentLocationMarker(
@@ -629,25 +1063,22 @@ function App() {
               )
 
               if (
-                !centeredRef.current &&
+                !hasCenteredRef.current &&
                 mapRef.current
               ) {
-                centeredRef.current =
+                hasCenteredRef.current =
                   true
 
-                mapRef.current
-                  .flyTo({
-                    center: [
-                      location.longitude,
-                      location.latitude
-                    ],
+                mapRef.current.flyTo({
+                  center: [
+                    location.longitude,
+                    location.latitude
+                  ],
 
-                    zoom:
-                      15,
+                  zoom: 15,
 
-                    duration:
-                      650
-                  })
+                  duration: 650
+                })
               }
 
               if (
@@ -659,7 +1090,7 @@ function App() {
                 pendingDestinationRef.current =
                   null
 
-                calculateRoute(
+                calculateRoutes(
                   location,
                   pending
                 )
@@ -668,8 +1099,12 @@ function App() {
 
             error => {
               console.log(
-                'LOCATION:',
+                'LOCATION ERROR:',
                 error
+              )
+
+              setErrorMessage(
+                'Please allow location access.'
               )
             },
 
@@ -725,9 +1160,7 @@ function App() {
             location.longitude,
             location.latitude
           ])
-          .addTo(
-            map
-          )
+          .addTo(map)
     } else {
       currentMarkerRef.current
         .setLngLat([
@@ -753,18 +1186,18 @@ function App() {
         search.trim()
 
       if (
-        query.length <
-        3
+        query.length < 3
       ) {
         if (
-          searchAbortRef.current
+          searchAbortControllerRef.current
         ) {
-          searchAbortRef.current
+          searchAbortControllerRef.current
             .abort()
         }
 
-        setResults([])
-        setSearching(false)
+        setSearchResults([])
+
+        setSearchLoading(false)
 
         return
       }
@@ -773,22 +1206,22 @@ function App() {
         setTimeout(
           async () => {
             const requestId =
-              ++searchRequestRef.current
+              ++searchRequestIdRef.current
 
             if (
-              searchAbortRef.current
+              searchAbortControllerRef.current
             ) {
-              searchAbortRef.current
+              searchAbortControllerRef.current
                 .abort()
             }
 
             const controller =
               new AbortController()
 
-            searchAbortRef.current =
+            searchAbortControllerRef.current =
               controller
 
-            setSearching(true)
+            setSearchLoading(true)
 
             try {
               const parameters =
@@ -800,17 +1233,21 @@ function App() {
               )
 
               const location =
-                locationRef.current
+                currentLocationRef.current
 
               if (location) {
                 parameters.set(
                   'lat',
-                  location.latitude
+                  String(
+                    location.latitude
+                  )
                 )
 
                 parameters.set(
                   'lon',
-                  location.longitude
+                  String(
+                    location.longitude
+                  )
                 )
               }
 
@@ -828,7 +1265,7 @@ function App() {
 
               if (
                 requestId !==
-                searchRequestRef.current
+                searchRequestIdRef.current
               ) {
                 return
               }
@@ -837,76 +1274,87 @@ function App() {
                 !response.ok
               ) {
                 throw new Error(
-                  'Search failed'
+                  data.error ||
+                  'Search failed.'
                 )
               }
 
-              const nextResults =
-                data.map(
-                  item => {
-                    let distance =
-                      Infinity
-
-                    if (
-                      location
-                    ) {
-                      distance =
-                        haversineMeters(
-                          location.longitude,
-                          location.latitude,
-                          Number(
-                            item.longitude
-                          ),
-                          Number(
-                            item.latitude
-                          )
-                        )
-                    }
-
-                    return {
-                      ...item,
-
-                      longitude:
+              const results =
+                data
+                  .map(
+                    item => {
+                      const longitude =
                         Number(
                           item.longitude
-                        ),
+                        )
 
-                      latitude:
+                      const latitude =
                         Number(
                           item.latitude
-                        ),
+                        )
 
-                      distance
+                      if (
+                        !Number.isFinite(
+                          longitude
+                        ) ||
+                        !Number.isFinite(
+                          latitude
+                        )
+                      ) {
+                        return null
+                      }
+
+                      let distance =
+                        Infinity
+
+                      if (
+                        location
+                      ) {
+                        distance =
+                          haversineMeters(
+                            location.longitude,
+                            location.latitude,
+                            longitude,
+                            latitude
+                          )
+                      }
+
+                      return {
+                        ...item,
+
+                        longitude,
+                        latitude,
+                        distance
+                      }
                     }
-                  }
-                )
+                  )
+                  .filter(Boolean)
 
-              console.log(
-                'SEARCH RESULTS:',
-                nextResults
+              setSearchResults(
+                results
               )
 
-              setResults(
-                nextResults
-              )
+              setErrorMessage('')
             } catch (
               error
             ) {
               if (
-                error.name !==
+                error.name ===
                 'AbortError'
               ) {
-                console.log(
-                  'SEARCH ERROR:',
-                  error
-                )
+                return
               }
+
+              console.error(
+                'SEARCH ERROR:',
+                error
+              )
             } finally {
               if (
                 requestId ===
-                searchRequestRef.current
+                searchRequestIdRef.current
               ) {
-                setSearching(
+                setSearchLoading(
                   false
                 )
               }
@@ -915,10 +1363,9 @@ function App() {
           350
         )
 
-      return () =>
-        clearTimeout(
-          timer
-        )
+      return () => {
+        clearTimeout(timer)
+      }
     },
     [
       search
@@ -935,28 +1382,39 @@ function App() {
       event.target.value
     )
 
-    setError('')
+    setErrorMessage('')
   }
 
   function resetSearch() {
     searchLockedRef.current =
       false
 
-    searchRequestRef.current++
+    searchRequestIdRef.current++
 
     if (
-      searchAbortRef.current
+      searchAbortControllerRef.current
     ) {
-      searchAbortRef.current
+      searchAbortControllerRef.current
         .abort()
     }
 
     setSearch('')
-    setResults([])
-    setDestination(null)
-    setRoute(null)
 
-    clearRoute()
+    setSearchResults([])
+
+    setDestination(null)
+
+    setRoutes([])
+
+    setSelectedRouteId(
+      'shortest'
+    )
+
+    setNavigationStarted(
+      false
+    )
+
+    clearRouteDrawing()
 
     if (
       destinationMarkerRef.current
@@ -979,17 +1437,18 @@ function App() {
     searchLockedRef.current =
       true
 
-    searchRequestRef.current++
+    searchRequestIdRef.current++
 
     if (
-      searchAbortRef.current
+      searchAbortControllerRef.current
     ) {
-      searchAbortRef.current
+      searchAbortControllerRef.current
         .abort()
     }
 
-    setResults([])
-    setSearching(false)
+    setSearchResults([])
+
+    setSearchLoading(false)
 
     const selected = {
       name:
@@ -1013,9 +1472,13 @@ function App() {
       selected.name
     )
 
-    setRoute(null)
+    setRoutes([])
 
-    clearRoute()
+    setSelectedRouteId(
+      'shortest'
+    )
+
+    clearRouteDrawing()
 
     if (
       destinationMarkerRef.current
@@ -1024,34 +1487,38 @@ function App() {
         .remove()
     }
 
-    destinationMarkerRef.current =
-      new maplibregl.Marker({
-        color:
-          '#ff3b30'
-      })
-        .setLngLat([
-          selected.longitude,
-          selected.latitude
-        ])
-        .addTo(
-          mapRef.current
-        )
+    if (
+      mapRef.current
+    ) {
+      destinationMarkerRef.current =
+        new maplibregl.Marker({
+          color:
+            '#ff3b30'
+        })
+          .setLngLat([
+            selected.longitude,
+            selected.latitude
+          ])
+          .addTo(
+            mapRef.current
+          )
+    }
 
     const current =
-      locationRef.current
+      currentLocationRef.current
 
     if (!current) {
       pendingDestinationRef.current =
         selected
 
-      setError(
+      setErrorMessage(
         'Getting your current location...'
       )
 
       return
     }
 
-    calculateRoute(
+    calculateRoutes(
       current,
       selected
     )
@@ -1061,15 +1528,13 @@ function App() {
   // ROUTING
   // ============================================================
 
-  async function calculateRoute(
+  async function calculateRoutes(
     start,
     end
   ) {
-    setRouteLoading(
-      true
-    )
+    setRouteLoading(true)
 
-    setError('')
+    setErrorMessage('')
 
     try {
       const response =
@@ -1113,39 +1578,211 @@ function App() {
       ) {
         throw new Error(
           data.error ||
-          'Could not calculate route.'
+          'Could not calculate routes.'
         )
       }
 
+      if (
+        !Array.isArray(
+          data.routes
+        )
+      ) {
+        throw new Error(
+          'Server response does not contain routes.'
+        )
+      }
+
+      const validRoutes =
+        data.routes.filter(
+          route =>
+            route &&
+            Array.isArray(
+              route.coordinates
+            ) &&
+            route.coordinates
+              .length >= 2
+        )
+
+      if (
+        validRoutes.length ===
+        0
+      ) {
+        throw new Error(
+          'No valid routes were returned.'
+        )
+      }
+
+      console.log('')
       console.log(
-        'CUSTOM A*:',
-        data
+        '=== EXACT ROUTE METRICS ==='
       )
 
-      setRoute(
-        data
+      console.table(
+        validRoutes.map(
+          route => ({
+            Route:
+              route.label,
+
+            'Distance m':
+              Number(
+                route.distanceMeters
+              ).toFixed(2),
+
+            'Distance mi':
+              Number(
+                route.distanceMiles
+              ).toFixed(5),
+
+            'Time min':
+              Number(
+                route.minutes
+              ).toFixed(3),
+
+            'Ascent m':
+              Number(
+                route.totalAscentMeters
+              ).toFixed(2),
+
+            'Avg grade %':
+              Number(
+                route.averageGradePercent
+              ).toFixed(3),
+
+            'Max grade %':
+              Number(
+                route.maximumGradePercent
+              ).toFixed(3),
+
+            'Energy kJ/kg':
+              Number(
+                route.energyKJPerKg
+              ).toFixed(4),
+
+            'Flat effort':
+              Number(
+                route.effortRatio
+              ).toFixed(4),
+
+            'Grade spacing m':
+              Number(
+                route.gradeSampleSpacingMeters
+              ).toFixed(2)
+          })
+        )
       )
 
-      drawRoute(
-        data
+      setRoutes(
+        validRoutes
+      )
+
+      const shortest =
+        validRoutes.find(
+          route =>
+            route.id ===
+            'shortest'
+        ) ||
+        validRoutes[0]
+
+      setSelectedRouteId(
+        shortest.id
+      )
+
+      drawRoutes(
+        validRoutes,
+        shortest
       )
 
       fitRoute(
-        data
+        shortest
       )
     } catch (
       error
     ) {
       console.error(
+        'ROUTE ERROR:',
         error
       )
 
-      setError(
+      setErrorMessage(
         error.message
       )
     } finally {
-      setRouteLoading(
-        false
+      setRouteLoading(false)
+    }
+  }
+
+  function selectRoute(
+    route
+  ) {
+    if (!route) {
+      return
+    }
+
+    setSelectedRouteId(
+      route.id
+    )
+
+    drawRoutes(
+      routes,
+      route
+    )
+
+    fitRoute(
+      route
+    )
+  }
+
+  // ============================================================
+  // NAVIGATION
+  // ============================================================
+
+  function startNavigation() {
+    if (
+      !selectedRoute
+    ) {
+      return
+    }
+
+    setNavigationStarted(
+      true
+    )
+
+    const current =
+      currentLocationRef.current
+
+    if (
+      current &&
+      mapRef.current
+    ) {
+      mapRef.current.flyTo({
+        center: [
+          current.longitude,
+          current.latitude
+        ],
+
+        zoom: 17,
+
+        duration: 700
+      })
+    }
+  }
+
+  function stopNavigation() {
+    setNavigationStarted(
+      false
+    )
+
+    if (
+      selectedRoute
+    ) {
+      setTimeout(
+        () => {
+          drawRoutes(
+            routes,
+            selectedRoute
+          )
+        },
+        50
       )
     }
   }
@@ -1160,12 +1797,13 @@ function App() {
     >
       <div
         className="map"
+
         ref={
-          mapElementRef
+          mapContainerRef
         }
       />
 
-      {!navigation && (
+      {!navigationStarted && (
         <div
           className="search-wrapper"
         >
@@ -1190,9 +1828,11 @@ function App() {
               placeholder="Search for a destination"
 
               autoComplete="off"
+
+              spellCheck="false"
             />
 
-            {searching && (
+            {searchLoading && (
               <span
                 className="search-progress"
               >
@@ -1201,10 +1841,12 @@ function App() {
             )}
 
             {search &&
-              !searching && (
+              !searchLoading && (
                 <button
                   className="search-clear"
+
                   type="button"
+
                   onClick={
                     resetSearch
                   }
@@ -1214,12 +1856,12 @@ function App() {
               )}
           </div>
 
-          {results.length >
+          {searchResults.length >
             0 && (
             <div
               className="autocomplete"
             >
-              {results.map(
+              {searchResults.map(
                 (
                   place,
                   index
@@ -1284,107 +1926,208 @@ function App() {
         <div
           className="route-loading"
         >
-          Finding route…
+          <div
+            className="route-spinner"
+          />
+
+          <div>
+            <strong>
+              Calculating routes
+            </strong>
+
+            <span>
+              Comparing distance and elevation
+            </span>
+          </div>
         </div>
       )}
 
-      {route &&
-        !navigation && (
+      {routes.length >
+        0 &&
+        !navigationStarted && (
           <div
-            className="route-bottom"
+            className="route-sheet"
           >
             <div
-              className="route-card"
+              className="route-options"
             >
-              <div
-                className="route-card-top"
-              >
-                <strong>
-                  My A* Route
-                </strong>
+              {routes.map(
+                route => (
+                  <button
+                    key={
+                      route.id
+                    }
 
-                <strong
-                  className="route-time"
-                >
-                  {formatTime(
-                    route.minutes
-                  )}
-                </strong>
-              </div>
+                    type="button"
 
-              <div
-                className="route-summary"
-              >
-                <span>
-                  {Number(
-                    route.distanceMiles
-                  ).toFixed(1)}
-                  {' '}mi
-                </span>
+                    className={
+                      [
+                        'route-option',
 
-                <span>
-                  Custom routing
-                </span>
-              </div>
+                        `route-option-${route.id}`,
 
-              <div
-                className="route-debug"
-              >
-                <span>
-                  Algorithm: A*
-                </span>
+                        route.id ===
+                        selectedRouteId
+                          ? 'route-option-selected'
+                          : ''
+                      ]
+                        .filter(Boolean)
+                        .join(' ')
+                    }
 
-                <span>
-                  Cost: distance
-                </span>
-              </div>
+                    onClick={
+                      () => {
+                        selectRoute(
+                          route
+                        )
+                      }
+                    }
+                  >
+                    <div
+                      className="route-option-top"
+                    >
+                      <div>
+                        <div
+                          className="route-option-name"
+                        >
+                          {route.label}
+                        </div>
 
-              <div
-                className="route-debug"
-              >
-                <span>
-                  {route.visitedNodes}
-                  {' '}nodes visited
-                </span>
+                        <div
+                          className="route-option-purpose"
+                        >
+                          {getRoutePurpose(
+                            route.id
+                          )}
+                        </div>
+                      </div>
 
-                <span>
-                  {route.graphNodes}
-                  {' '}graph nodes
-                </span>
-              </div>
+                      <div
+                        className="route-color-dot"
+                      />
+                    </div>
+
+                    <div
+                      className="route-option-time"
+                    >
+                      {formatTime(
+                        route.minutes
+                      )}
+                    </div>
+
+                    <div
+                      className="route-option-distance"
+                    >
+                      {Number(
+                        route.distanceMiles
+                      ).toFixed(2)}
+                      {' '}mi
+                    </div>
+
+                    <div
+                      className="route-tradeoff"
+                    >
+                      {getTradeoffText(
+                        route,
+                        shortestRoute
+                      )}
+                    </div>
+
+                    {route.samePathAs && (
+                      <div
+                        className="same-route"
+                      >
+                        {getSameRouteText(
+                          route
+                        )}
+                      </div>
+                    )}
+                  </button>
+                )
+              )}
             </div>
 
+            {selectedRoute && (
+              <div
+                className="route-details"
+              >
+                <div
+                  className="route-detail"
+                >
+                  <strong>
+                    ↑{' '}
+                    {Number(
+                      selectedRoute
+                        .totalAscentMeters ||
+                      0
+                    ).toFixed(0)}
+                    {' '}m
+                  </strong>
+
+                  <span>
+                    Ascent
+                  </span>
+                </div>
+
+                <div
+                  className="route-detail"
+                >
+                  <strong>
+                    {Number(
+                      selectedRoute
+                        .averageGradePercent ||
+                      0
+                    ).toFixed(1)}
+                    %
+                  </strong>
+
+                  <span>
+                    Avg grade
+                  </span>
+                </div>
+
+                <div
+                  className="route-detail"
+                >
+                  <strong>
+                    {Number(
+                      selectedRoute
+                        .maximumGradePercent ||
+                      0
+                    ).toFixed(1)}
+                    %
+                  </strong>
+
+                  <span>
+                    Max grade
+                  </span>
+                </div>
+
+                <div
+                  className="route-detail"
+                >
+                  <strong>
+                    {Number(
+                      selectedRoute
+                        .energyKJPerKg ||
+                      0
+                    ).toFixed(2)}
+                  </strong>
+
+                  <span>
+                    kJ/kg energy
+                  </span>
+                </div>
+              </div>
+            )}
+
             <button
-              className="start-button"
               type="button"
 
+              className="start-button"
+
               onClick={
-                () => {
-                  setNavigation(
-                    true
-                  )
-
-                  const current =
-                    locationRef.current
-
-                  if (
-                    current &&
-                    mapRef.current
-                  ) {
-                    mapRef.current.flyTo({
-                      center: [
-                        current.longitude,
-                        current.latitude
-                      ],
-
-                      zoom:
-                        17,
-
-                      duration:
-                        700
-                    })
-                  }
-                }
+                startNavigation
               }
             >
               Start
@@ -1392,48 +2135,63 @@ function App() {
           </div>
         )}
 
-      {navigation &&
-        route && (
+      {navigationStarted &&
+        selectedRoute && (
           <div
             className="navigation-card"
           >
             <button
               type="button"
 
+              className="navigation-back"
+
               onClick={
-                () =>
-                  setNavigation(
-                    false
-                  )
+                stopNavigation
               }
             >
               ‹
             </button>
 
-            <div>
+            <div
+              className="navigation-main"
+            >
               <strong>
                 {destination?.name}
               </strong>
 
               <span>
+                {selectedRoute.label}
+                {' · '}
                 {formatTime(
-                  route.minutes
+                  selectedRoute.minutes
                 )}
                 {' · '}
                 {Number(
-                  route.distanceMiles
-                ).toFixed(1)}
+                  selectedRoute.distanceMiles
+                ).toFixed(2)}
                 {' '}mi
               </span>
+            </div>
+
+            <div
+              className="navigation-ascent"
+            >
+              ↑{' '}
+              {Number(
+                selectedRoute
+                  .totalAscentMeters ||
+                0
+              ).toFixed(0)}
+              {' '}m
             </div>
           </div>
         )}
 
-      {error && (
+      {errorMessage && (
         <div
           className="error-toast"
         >
-          {error}
+          {errorMessage}
         </div>
       )}
     </div>

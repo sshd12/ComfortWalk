@@ -1,16 +1,13 @@
 import express from 'express'
+import { PNG } from 'pngjs'
 
 const app = express()
 
 const PORT = 8787
 
 const METERS_PER_MILE = 1609.344
-
-const WALKING_SPEED_METERS_PER_SECOND =
-  1.35
-
-const MAX_DIRECT_DISTANCE_METERS =
-  12000
+const WALKING_SPEED_METERS_PER_SECOND = 1.35
+const MAX_DIRECT_DISTANCE_METERS = 12000
 
 const PHOTON_URL =
   'https://photon.komoot.io/api/'
@@ -21,8 +18,26 @@ const OVERPASS_SERVERS = [
   'https://overpass-api.de/api/interpreter'
 ]
 
-const OVERPASS_USER_AGENT =
+const USER_AGENT =
   'ComfortWalkStudentProject/1.0'
+
+const TERRAIN_ZOOM = 14
+
+const TERRAIN_URL =
+  'https://s3.amazonaws.com/elevation-tiles-prod/terrarium'
+
+const FLAT_WALKING_COST = 2.5
+
+const MAX_MODEL_GRADE = 0.45
+
+// Reported grade is calculated at roughly this spacing.
+const GRADE_SAMPLE_DISTANCE_METERS = 25
+
+// First smoothing pass on the graph.
+const GRAPH_ELEVATION_SMOOTH_RADIUS_METERS = 30
+
+// Prevent tiny OSM edges from producing absurd routing grades.
+const ROUTING_GRADE_MIN_RUN_METERS = 20
 
 app.use(
   express.json({
@@ -34,23 +49,40 @@ app.use(
 // CACHE
 // ============================================================
 
-const graphCache =
-  new Map()
+const graphCache = new Map()
+const searchCache = new Map()
+const terrainTileCache = new Map()
 
-const searchCache =
-  new Map()
-
-const MAX_GRAPH_CACHE_SIZE =
-  8
+const MAX_GRAPH_CACHE_SIZE = 8
+const MAX_TERRAIN_CACHE_SIZE = 64
 
 const SEARCH_CACHE_TIME =
   5 * 60 * 1000
+
+function trimMapCache(
+  map,
+  maximumSize
+) {
+  while (
+    map.size >
+    maximumSize
+  ) {
+    const firstKey =
+      map.keys().next().value
+
+    map.delete(
+      firstKey
+    )
+  }
+}
 
 function getCachedSearch(
   key
 ) {
   const item =
-    searchCache.get(key)
+    searchCache.get(
+      key
+    )
 
   if (!item) {
     return null
@@ -61,7 +93,9 @@ function getCachedSearch(
       item.time >
     SEARCH_CACHE_TIME
   ) {
-    searchCache.delete(key)
+    searchCache.delete(
+      key
+    )
 
     return null
   }
@@ -69,72 +103,28 @@ function getCachedSearch(
   return item.data
 }
 
-function saveSearchCache(
+function setCachedSearch(
   key,
   data
 ) {
   searchCache.set(
     key,
     {
-      time: Date.now(),
+      time:
+        Date.now(),
+
       data
     }
   )
 
-  while (
-    searchCache.size >
+  trimMapCache(
+    searchCache,
     100
-  ) {
-    const firstKey =
-      searchCache
-        .keys()
-        .next()
-        .value
-
-    searchCache.delete(
-      firstKey
-    )
-  }
-}
-
-function makeGraphCacheKey(
-  bounds
-) {
-  return [
-    bounds.south.toFixed(3),
-    bounds.west.toFixed(3),
-    bounds.north.toFixed(3),
-    bounds.east.toFixed(3)
-  ].join('|')
-}
-
-function saveGraphCache(
-  key,
-  graph
-) {
-  graphCache.set(
-    key,
-    graph
   )
-
-  while (
-    graphCache.size >
-    MAX_GRAPH_CACHE_SIZE
-  ) {
-    const firstKey =
-      graphCache
-        .keys()
-        .next()
-        .value
-
-    graphCache.delete(
-      firstKey
-    )
-  }
 }
 
 // ============================================================
-// MATH
+// GENERAL MATH
 // ============================================================
 
 function toRadians(
@@ -144,6 +134,20 @@ function toRadians(
     value *
     Math.PI /
     180
+  )
+}
+
+function clamp(
+  value,
+  minimum,
+  maximum
+) {
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      value
+    )
   )
 }
 
@@ -157,10 +161,14 @@ function haversineMeters(
     6371000
 
   const phi1 =
-    toRadians(lat1)
+    toRadians(
+      lat1
+    )
 
   const phi2 =
-    toRadians(lat2)
+    toRadians(
+      lat2
+    )
 
   const deltaLatitude =
     toRadians(
@@ -187,7 +195,9 @@ function haversineMeters(
     earthRadius *
     Math.atan2(
       Math.sqrt(a),
-      Math.sqrt(1 - a)
+      Math.sqrt(
+        1 - a
+      )
     )
   )
 }
@@ -253,8 +263,205 @@ function makeBounds(
   }
 }
 
+function makeGraphCacheKey(
+  bounds
+) {
+  return [
+    bounds.south.toFixed(3),
+    bounds.west.toFixed(3),
+    bounds.north.toFixed(3),
+    bounds.east.toFixed(3)
+  ].join('|')
+}
+
 // ============================================================
-// PHOTON AUTOCOMPLETE
+// WALKING ENERGY MODEL
+// ============================================================
+
+function walkingEnergyCost(
+  grade
+) {
+  const slope =
+    clamp(
+      grade,
+      -MAX_MODEL_GRADE,
+      MAX_MODEL_GRADE
+    )
+
+  const cost =
+    280.5 * slope ** 5 -
+    58.7 * slope ** 4 -
+    76.8 * slope ** 3 +
+    51.9 * slope ** 2 +
+    19.6 * slope +
+    2.5
+
+  return Math.max(
+    0.5,
+    cost
+  )
+}
+
+function getNodeElevation(
+  node
+) {
+  if (
+    Number.isFinite(
+      node?.smoothedElevation
+    )
+  ) {
+    return node
+      .smoothedElevation
+  }
+
+  if (
+    Number.isFinite(
+      node?.elevation
+    )
+  ) {
+    return node
+      .elevation
+  }
+
+  return 0
+}
+
+// ============================================================
+// ROUTING EDGE COST
+// ============================================================
+
+function getEdgeProfile(
+  graph,
+  fromId,
+  edge
+) {
+  const fromNode =
+    graph.nodes.get(
+      fromId
+    )
+
+  const toNode =
+    graph.nodes.get(
+      edge.to
+    )
+
+  if (
+    !fromNode ||
+    !toNode
+  ) {
+    return {
+      grade: 0,
+      energyPerKgJ: 0,
+      flatEquivalentMeters:
+        edge.distance
+    }
+  }
+
+  const elevationChange =
+    getNodeElevation(
+      toNode
+    ) -
+    getNodeElevation(
+      fromNode
+    )
+
+  // Small OSM edges can be only a couple meters long.
+  // Using at least 20 m for grade reduces terrain-pixel noise.
+  const gradeRun =
+    Math.max(
+      edge.distance,
+      ROUTING_GRADE_MIN_RUN_METERS
+    )
+
+  const grade =
+    clamp(
+      elevationChange /
+        gradeRun,
+      -MAX_MODEL_GRADE,
+      MAX_MODEL_GRADE
+    )
+
+  const costPerMeter =
+    walkingEnergyCost(
+      grade
+    )
+
+  const energyPerKgJ =
+    costPerMeter *
+    edge.distance
+
+  const flatEquivalentMeters =
+    energyPerKgJ /
+    FLAT_WALKING_COST
+
+  return {
+    grade,
+    energyPerKgJ,
+    flatEquivalentMeters
+  }
+}
+
+function getEdgeCost(
+  graph,
+  fromId,
+  edge,
+  mode
+) {
+  if (
+    mode ===
+    'shortest'
+  ) {
+    return edge.distance
+  }
+
+  const profile =
+    getEdgeProfile(
+      graph,
+      fromId,
+      edge
+    )
+
+  if (
+    mode ===
+    'balanced'
+  ) {
+    return (
+      0.5 *
+        edge.distance +
+      0.5 *
+        profile.flatEquivalentMeters
+    )
+  }
+
+  return (
+    profile
+      .flatEquivalentMeters
+  )
+}
+
+// Lower-bound multipliers so A* heuristic stays conservative.
+function getHeuristicMultiplier(
+  mode
+) {
+  if (
+    mode ===
+    'shortest'
+  ) {
+    return 1
+  }
+
+  if (
+    mode ===
+    'balanced'
+  ) {
+    return 0.6
+  }
+
+  return 0.2
+}
+
+// ============================================================
+// PHOTON SEARCH
 // ============================================================
 
 function buildPhotonAddress(
@@ -271,7 +478,9 @@ function buildPhotonAddress(
       .join(' ')
 
   if (street) {
-    parts.push(street)
+    parts.push(
+      street
+    )
   }
 
   const city =
@@ -283,9 +492,13 @@ function buildPhotonAddress(
 
   if (
     city &&
-    !parts.includes(city)
+    !parts.includes(
+      city
+    )
   ) {
-    parts.push(city)
+    parts.push(
+      city
+    )
   }
 
   if (
@@ -369,6 +582,7 @@ function normalizePhotonFeature(
           index,
 
         latitude,
+
         longitude
       ].join('-'),
 
@@ -439,7 +653,7 @@ async function photonSearch(
             'application/json',
 
           'User-Agent':
-            OVERPASS_USER_AGENT
+            USER_AGENT
         }
       }
     )
@@ -456,7 +670,8 @@ async function photonSearch(
     await response.json()
 
   return (
-    data.features || []
+    data.features ||
+    []
   )
 }
 
@@ -474,8 +689,7 @@ app.get(
         ).trim()
 
       if (
-        query.length <
-        3
+        query.length < 3
       ) {
         return response.json(
           []
@@ -520,7 +734,7 @@ app.get(
         )
       }
 
-      const firstResults =
+      const nearby =
         await photonSearch(
           query,
           latitude,
@@ -529,15 +743,14 @@ app.get(
         )
 
       let features = [
-        ...firstResults
+        ...nearby
       ]
 
       if (
-        features.length <
-        6
+        features.length < 6
       ) {
         try {
-          const backupResults =
+          const wider =
             await photonSearch(
               query,
               latitude,
@@ -545,15 +758,14 @@ app.get(
               false
             )
 
-          features = [
-            ...features,
-            ...backupResults
-          ]
+          features.push(
+            ...wider
+          )
         } catch (
           error
         ) {
           console.log(
-            'Photon fallback failed:',
+            'Photon fallback:',
             error.message
           )
         }
@@ -573,8 +785,7 @@ app.get(
           )
           .filter(Boolean)
 
-      const uniqueResults =
-        []
+      const results = []
 
       const seen =
         new Set()
@@ -603,25 +814,25 @@ app.get(
 
         seen.add(key)
 
-        uniqueResults.push(
+        results.push(
           item
         )
 
         if (
-          uniqueResults.length >=
+          results.length >=
           10
         ) {
           break
         }
       }
 
-      saveSearchCache(
+      setCachedSearch(
         cacheKey,
-        uniqueResults
+        results
       )
 
       return response.json(
-        uniqueResults
+        results
       )
     } catch (
       error
@@ -635,7 +846,7 @@ app.get(
         .status(502)
         .json({
           error:
-            'Search service failed.'
+            'Search failed.'
         })
     }
   }
@@ -701,10 +912,9 @@ class MinHeap {
     index
   ) {
     while (
-      index >
-      0
+      index > 0
     ) {
-      const parentIndex =
+      const parent =
         Math.floor(
           (index - 1) /
           2
@@ -712,7 +922,7 @@ class MinHeap {
 
       if (
         this.items[
-          parentIndex
+          parent
         ].priority <=
         this.items[
           index
@@ -723,11 +933,11 @@ class MinHeap {
 
       const temporary =
         this.items[
-          parentIndex
+          parent
         ]
 
       this.items[
-        parentIndex
+        parent
       ] =
         this.items[
           index
@@ -739,7 +949,7 @@ class MinHeap {
         temporary
 
       index =
-        parentIndex
+        parent
     }
   }
 
@@ -751,12 +961,10 @@ class MinHeap {
         index
 
       const left =
-        index * 2 +
-        1
+        index * 2 + 1
 
       const right =
-        index * 2 +
-        2
+        index * 2 + 2
 
       if (
         left <
@@ -813,7 +1021,7 @@ class MinHeap {
 }
 
 // ============================================================
-// OVERPASS QUERY
+// OVERPASS
 // ============================================================
 
 function makeOverpassQuery(
@@ -845,10 +1053,6 @@ out body;
 out skel qt;
 `
 }
-
-// ============================================================
-// OVERPASS FETCH
-// ============================================================
 
 async function fetchOverpass(
   query
@@ -888,7 +1092,7 @@ async function fetchOverpass(
       const started =
         Date.now()
 
-      const response =
+      const result =
         await fetch(
           server,
           {
@@ -903,7 +1107,7 @@ async function fetchOverpass(
                 'application/x-www-form-urlencoded;charset=UTF-8',
 
               'User-Agent':
-                OVERPASS_USER_AGENT
+                USER_AGENT
             },
 
             body:
@@ -918,46 +1122,23 @@ async function fetchOverpass(
         timeoutId
       )
 
-      const elapsed =
-        Date.now() -
-        started
-
       console.log(
-        'Overpass status:',
-        response.status,
-        'time:',
-        `${elapsed} ms`
+        'Overpass:',
+        result.status,
+        `${Date.now() - started} ms`
       )
 
       if (
-        !response.ok
+        !result.ok
       ) {
-        const errorText =
-          await response
-            .text()
-
-        console.log(
-          'Overpass response:',
-          errorText.slice(
-            0,
-            300
-          )
-        )
-
         throw new Error(
-          `Overpass returned ${response.status}`
+          `Overpass returned ${result.status}`
         )
       }
 
-      const data =
-        await response.json()
-
-      console.log(
-        'Overpass success:',
-        server
+      return (
+        await result.json()
       )
-
-      return data
     } catch (
       error
     ) {
@@ -965,9 +1146,8 @@ async function fetchOverpass(
         timeoutId
       )
 
-      console.error(
-        'Overpass attempt failed:',
-        server,
+      console.log(
+        'Overpass failed:',
         error.message
       )
 
@@ -1023,7 +1203,13 @@ function buildGraph(
         lon:
           Number(
             element.lon
-          )
+          ),
+
+        elevation:
+          null,
+
+        smoothedElevation:
+          null
       }
     )
   }
@@ -1033,33 +1219,36 @@ function buildGraph(
     to,
     way
   ) {
-    const fromNode =
-      nodes.get(from)
+    const first =
+      nodes.get(
+        from
+      )
 
-    const toNode =
-      nodes.get(to)
+    const second =
+      nodes.get(
+        to
+      )
 
     if (
-      !fromNode ||
-      !toNode
+      !first ||
+      !second
     ) {
       return
     }
 
     const distance =
       haversineMeters(
-        fromNode.lat,
-        fromNode.lon,
-        toNode.lat,
-        toNode.lon
+        first.lat,
+        first.lon,
+        second.lat,
+        second.lon
       )
 
     if (
       !Number.isFinite(
         distance
       ) ||
-      distance <=
-        0
+      distance <= 0
     ) {
       return
     }
@@ -1079,11 +1268,7 @@ function buildGraph(
       .get(from)
       .push({
         to,
-
         distance,
-
-        wayId:
-          way.id,
 
         name:
           way.tags
@@ -1145,9 +1330,652 @@ function buildGraph(
 
   return {
     nodes,
-    adjacency
+    adjacency,
+    elevationCoverage: 0
   }
 }
+
+// ============================================================
+// TERRAIN TILES
+// ============================================================
+
+function terrainPosition(
+  lat,
+  lon,
+  zoom
+) {
+  const n =
+    2 ** zoom
+
+  const latitude =
+    clamp(
+      lat,
+      -85.05112878,
+      85.05112878
+    )
+
+  const x =
+    (
+      lon + 180
+    ) /
+    360 *
+    n
+
+  const latitudeRadians =
+    toRadians(
+      latitude
+    )
+
+  const y =
+    (
+      1 -
+      (
+        Math.log(
+          Math.tan(
+            latitudeRadians
+          ) +
+          1 /
+          Math.cos(
+            latitudeRadians
+          )
+        ) /
+        Math.PI
+      )
+    ) /
+    2 *
+    n
+
+  const tileX =
+    Math.floor(x)
+
+  const tileY =
+    Math.floor(y)
+
+  return {
+    tileX,
+    tileY,
+
+    fractionX:
+      x - tileX,
+
+    fractionY:
+      y - tileY
+  }
+}
+
+async function loadTerrainTile(
+  zoom,
+  x,
+  y
+) {
+  const key =
+    `${zoom}/${x}/${y}`
+
+  if (
+    terrainTileCache.has(
+      key
+    )
+  ) {
+    return (
+      terrainTileCache.get(
+        key
+      )
+    )
+  }
+
+  const controller =
+    new AbortController()
+
+  const timeoutId =
+    setTimeout(
+      () => {
+        controller.abort()
+      },
+      12000
+    )
+
+  try {
+    const response =
+      await fetch(
+        `${TERRAIN_URL}/${zoom}/${x}/${y}.png`,
+        {
+          signal:
+            controller.signal,
+
+          headers: {
+            'User-Agent':
+              USER_AGENT
+          }
+        }
+      )
+
+    clearTimeout(
+      timeoutId
+    )
+
+    if (
+      !response.ok
+    ) {
+      throw new Error(
+        `Terrain tile returned ${response.status}`
+      )
+    }
+
+    const arrayBuffer =
+      await response
+        .arrayBuffer()
+
+    const buffer =
+      Buffer.from(
+        arrayBuffer
+      )
+
+    const png =
+      PNG.sync.read(
+        buffer
+      )
+
+    terrainTileCache.set(
+      key,
+      png
+    )
+
+    trimMapCache(
+      terrainTileCache,
+      MAX_TERRAIN_CACHE_SIZE
+    )
+
+    return png
+  } catch (
+    error
+  ) {
+    clearTimeout(
+      timeoutId
+    )
+
+    throw error
+  }
+}
+
+function decodeTerrariumElevation(
+  png,
+  fractionX,
+  fractionY
+) {
+  const pixelX =
+    clamp(
+      Math.floor(
+        fractionX *
+        png.width
+      ),
+      0,
+      png.width - 1
+    )
+
+  const pixelY =
+    clamp(
+      Math.floor(
+        fractionY *
+        png.height
+      ),
+      0,
+      png.height - 1
+    )
+
+  const index =
+    (
+      pixelY *
+        png.width +
+      pixelX
+    ) *
+    4
+
+  const red =
+    png.data[
+      index
+    ]
+
+  const green =
+    png.data[
+      index + 1
+    ]
+
+  const blue =
+    png.data[
+      index + 2
+    ]
+
+  const alpha =
+    png.data[
+      index + 3
+    ]
+
+  if (
+    alpha === 0
+  ) {
+    return null
+  }
+
+  const elevation =
+    red * 256 +
+    green +
+    blue / 256 -
+    32768
+
+  if (
+    elevation < -500 ||
+    elevation > 9000
+  ) {
+    return null
+  }
+
+  return elevation
+}
+
+async function populateGraphElevations(
+  graph
+) {
+  const groups =
+    new Map()
+
+  const connectedNodeIds =
+    Array.from(
+      graph.adjacency.keys()
+    )
+
+  for (
+    const nodeId
+    of connectedNodeIds
+  ) {
+    const node =
+      graph.nodes.get(
+        nodeId
+      )
+
+    if (!node) {
+      continue
+    }
+
+    const position =
+      terrainPosition(
+        node.lat,
+        node.lon,
+        TERRAIN_ZOOM
+      )
+
+    const key =
+      `${TERRAIN_ZOOM}/${position.tileX}/${position.tileY}`
+
+    if (
+      !groups.has(
+        key
+      )
+    ) {
+      groups.set(
+        key,
+        {
+          zoom:
+            TERRAIN_ZOOM,
+
+          x:
+            position.tileX,
+
+          y:
+            position.tileY,
+
+          samples: []
+        }
+      )
+    }
+
+    groups
+      .get(key)
+      .samples
+      .push({
+        node,
+
+        fractionX:
+          position.fractionX,
+
+        fractionY:
+          position.fractionY
+      })
+  }
+
+  const groupList =
+    Array.from(
+      groups.values()
+    )
+
+  let assigned = 0
+
+  const batchSize = 8
+
+  for (
+    let start = 0;
+    start <
+      groupList.length;
+    start += batchSize
+  ) {
+    const batch =
+      groupList.slice(
+        start,
+        start + batchSize
+      )
+
+    await Promise.all(
+      batch.map(
+        async group => {
+          try {
+            const png =
+              await loadTerrainTile(
+                group.zoom,
+                group.x,
+                group.y
+              )
+
+            for (
+              const sample
+              of group.samples
+            ) {
+              const elevation =
+                decodeTerrariumElevation(
+                  png,
+                  sample.fractionX,
+                  sample.fractionY
+                )
+
+              if (
+                Number.isFinite(
+                  elevation
+                )
+              ) {
+                sample.node
+                  .elevation =
+                  elevation
+
+                assigned++
+              }
+            }
+          } catch (
+            error
+          ) {
+            console.log(
+              'Terrain tile failed:',
+              group.x,
+              group.y,
+              error.message
+            )
+          }
+        }
+      )
+    )
+  }
+
+  const coverage =
+    connectedNodeIds.length >
+      0
+      ? assigned /
+        connectedNodeIds.length
+      : 0
+
+  graph.elevationCoverage =
+    coverage
+
+  console.log(
+    'Elevation coverage:',
+    `${(
+      coverage *
+      100
+    ).toFixed(1)}%`
+  )
+
+  if (
+    coverage < 0.8
+  ) {
+    throw new Error(
+      'Not enough elevation data.'
+    )
+  }
+}
+
+// ============================================================
+// GRAPH ELEVATION SMOOTHING
+// ============================================================
+
+function smoothGraphElevations(
+  graph,
+  radiusMeters =
+    GRAPH_ELEVATION_SMOOTH_RADIUS_METERS
+) {
+  const connectedNodes =
+    Array.from(
+      graph.adjacency.keys()
+    )
+      .map(
+        id =>
+          graph.nodes.get(
+            id
+          )
+      )
+      .filter(
+        node =>
+          node &&
+          Number.isFinite(
+            node.elevation
+          )
+      )
+
+  if (
+    connectedNodes.length ===
+    0
+  ) {
+    return
+  }
+
+  let latitudeSum = 0
+
+  for (
+    const node
+    of connectedNodes
+  ) {
+    latitudeSum +=
+      node.lat
+  }
+
+  const averageLatitude =
+    latitudeSum /
+    connectedNodes.length
+
+  const latitudeCellSize =
+    radiusMeters /
+    111320
+
+  const longitudeCellSize =
+    radiusMeters /
+    (
+      111320 *
+      Math.cos(
+        toRadians(
+          averageLatitude
+        )
+      )
+    )
+
+  const buckets =
+    new Map()
+
+  function getBucketPosition(
+    node
+  ) {
+    return {
+      x:
+        Math.floor(
+          node.lon /
+          longitudeCellSize
+        ),
+
+      y:
+        Math.floor(
+          node.lat /
+          latitudeCellSize
+        )
+    }
+  }
+
+  function getBucketKey(
+    x,
+    y
+  ) {
+    return `${x}:${y}`
+  }
+
+  for (
+    const node
+    of connectedNodes
+  ) {
+    const position =
+      getBucketPosition(
+        node
+      )
+
+    const key =
+      getBucketKey(
+        position.x,
+        position.y
+      )
+
+    if (
+      !buckets.has(
+        key
+      )
+    ) {
+      buckets.set(
+        key,
+        []
+      )
+    }
+
+    buckets
+      .get(key)
+      .push(
+        node
+      )
+  }
+
+  const sigma =
+    radiusMeters /
+    2
+
+  const nextElevations =
+    new Map()
+
+  for (
+    const node
+    of connectedNodes
+  ) {
+    const position =
+      getBucketPosition(
+        node
+      )
+
+    let weightedElevation = 0
+    let totalWeight = 0
+
+    for (
+      let dx = -1;
+      dx <= 1;
+      dx++
+    ) {
+      for (
+        let dy = -1;
+        dy <= 1;
+        dy++
+      ) {
+        const key =
+          getBucketKey(
+            position.x + dx,
+            position.y + dy
+          )
+
+        const nearby =
+          buckets.get(
+            key
+          ) || []
+
+        for (
+          const neighbor
+          of nearby
+        ) {
+          const distance =
+            haversineMeters(
+              node.lat,
+              node.lon,
+              neighbor.lat,
+              neighbor.lon
+            )
+
+          if (
+            distance >
+            radiusMeters
+          ) {
+            continue
+          }
+
+          const weight =
+            Math.exp(
+              -0.5 *
+              (
+                distance /
+                sigma
+              ) ** 2
+            )
+
+          weightedElevation +=
+            neighbor.elevation *
+            weight
+
+          totalWeight +=
+            weight
+        }
+      }
+    }
+
+    if (
+      totalWeight > 0
+    ) {
+      nextElevations.set(
+        node.id,
+        weightedElevation /
+        totalWeight
+      )
+    } else {
+      nextElevations.set(
+        node.id,
+        node.elevation
+      )
+    }
+  }
+
+  for (
+    const node
+    of connectedNodes
+  ) {
+    node.smoothedElevation =
+      nextElevations.get(
+        node.id
+      )
+  }
+
+  console.log(
+    'Graph elevation smoothing:',
+    `${radiusMeters} m radius`
+  )
+}
+
+// ============================================================
+// GRAPH LOADING
+// ============================================================
 
 async function getWalkingGraph(
   bounds
@@ -1173,13 +2001,13 @@ async function getWalkingGraph(
     )
   }
 
+  const started =
+    Date.now()
+
   const query =
     makeOverpassQuery(
       bounds
     )
-
-  const started =
-    Date.now()
 
   const osmData =
     await fetchOverpass(
@@ -1192,17 +2020,40 @@ async function getWalkingGraph(
     )
 
   console.log(
-    'Graph built:',
+    'Graph:',
     graph.nodes.size,
-    'nodes,',
-    graph.adjacency.size,
-    'connected nodes,',
-    `${Date.now() - started} ms`
+    'nodes'
   )
 
-  saveGraphCache(
+  const elevationStarted =
+    Date.now()
+
+  await populateGraphElevations(
+    graph
+  )
+
+  smoothGraphElevations(
+    graph
+  )
+
+  console.log(
+    'Elevation + smoothing:',
+    `${Date.now() - elevationStarted} ms`
+  )
+
+  graphCache.set(
     cacheKey,
     graph
+  )
+
+  trimMapCache(
+    graphCache,
+    MAX_GRAPH_CACHE_SIZE
+  )
+
+  console.log(
+    'Total graph load:',
+    `${Date.now() - started} ms`
   )
 
   return graph
@@ -1265,13 +2116,14 @@ function findNearestNode(
 }
 
 // ============================================================
-// CUSTOM A*
+// A*
 // ============================================================
 
 function aStar(
   graph,
   startNodeId,
-  goalNodeId
+  goalNodeId,
+  mode
 ) {
   const startNode =
     graph.nodes.get(
@@ -1317,12 +2169,14 @@ function aStar(
         startNode.lon,
         goalNode.lat,
         goalNode.lon
+      ) *
+      getHeuristicMultiplier(
+        mode
       )
   })
 
   while (
-    open.size >
-    0
+    open.size > 0
   ) {
     const current =
       open.pop()
@@ -1342,30 +2196,29 @@ function aStar(
       currentId ===
       goalNodeId
     ) {
-      const path =
-        []
+      const path = []
 
-      let node =
+      let nodeId =
         goalNodeId
 
       while (
-        node !==
+        nodeId !==
         undefined
       ) {
         path.push(
-          node
+          nodeId
         )
 
         if (
-          node ===
+          nodeId ===
           startNodeId
         ) {
           break
         }
 
-        node =
+        nodeId =
           cameFrom.get(
-            node
+            nodeId
           )
       }
 
@@ -1374,14 +2227,13 @@ function aStar(
       return {
         path,
 
-        distance:
+        cost:
           gScore.get(
             goalNodeId
           ),
 
         visitedNodes:
-          closed.size +
-          1
+          closed.size + 1
       }
     }
 
@@ -1411,9 +2263,17 @@ function aStar(
         continue
       }
 
-      const tentativeCost =
+      const stepCost =
+        getEdgeCost(
+          graph,
+          currentId,
+          edge,
+          mode
+        )
+
+      const tentative =
         currentCost +
-        edge.distance
+        stepCost
 
       const oldCost =
         gScore.get(
@@ -1422,20 +2282,20 @@ function aStar(
         Infinity
 
       if (
-        tentativeCost >=
+        tentative >=
         oldCost
       ) {
         continue
       }
 
+      gScore.set(
+        edge.to,
+        tentative
+      )
+
       cameFrom.set(
         edge.to,
         currentId
-      )
-
-      gScore.set(
-        edge.to,
-        tentativeCost
       )
 
       const neighbor =
@@ -1453,6 +2313,9 @@ function aStar(
           neighbor.lon,
           goalNode.lat,
           goalNode.lon
+        ) *
+        getHeuristicMultiplier(
+          mode
         )
 
       open.push({
@@ -1460,7 +2323,7 @@ function aStar(
           edge.to,
 
         priority:
-          tentativeCost +
+          tentative +
           heuristic
       })
     }
@@ -1470,36 +2333,544 @@ function aStar(
 }
 
 // ============================================================
-// PATH TO COORDINATES
+// ROUTE PROFILE
 // ============================================================
 
-function pathToCoordinates(
+function makeOrderedPathPoints(
   graph,
   path
 ) {
-  return path
-    .map(
-      nodeId => {
-        const node =
-          graph.nodes.get(
-            nodeId
-          )
+  const points = []
 
-        if (!node) {
-          return null
-        }
+  let totalDistance = 0
 
-        return [
-          node.lon,
-          node.lat
+  for (
+    let index = 0;
+    index < path.length;
+    index++
+  ) {
+    const node =
+      graph.nodes.get(
+        path[index]
+      )
+
+    if (!node) {
+      continue
+    }
+
+    if (
+      points.length > 0
+    ) {
+      const previous =
+        points[
+          points.length - 1
         ]
-      }
+
+      totalDistance +=
+        haversineMeters(
+          previous.lat,
+          previous.lon,
+          node.lat,
+          node.lon
+        )
+    }
+
+    points.push({
+      lat:
+        node.lat,
+
+      lon:
+        node.lon,
+
+      elevation:
+        getNodeElevation(
+          node
+        ),
+
+      distanceAlong:
+        totalDistance
+    })
+  }
+
+  return {
+    points,
+    totalDistance
+  }
+}
+
+function interpolateProfilePoint(
+  first,
+  second,
+  targetDistance
+) {
+  const segmentDistance =
+    second.distanceAlong -
+    first.distanceAlong
+
+  if (
+    segmentDistance <= 0
+  ) {
+    return {
+      lat:
+        first.lat,
+
+      lon:
+        first.lon,
+
+      elevation:
+        first.elevation,
+
+      distanceAlong:
+        targetDistance
+    }
+  }
+
+  const fraction =
+    (
+      targetDistance -
+      first.distanceAlong
+    ) /
+    segmentDistance
+
+  return {
+    lat:
+      first.lat +
+      (
+        second.lat -
+        first.lat
+      ) *
+      fraction,
+
+    lon:
+      first.lon +
+      (
+        second.lon -
+        first.lon
+      ) *
+      fraction,
+
+    elevation:
+      first.elevation +
+      (
+        second.elevation -
+        first.elevation
+      ) *
+      fraction,
+
+    distanceAlong:
+      targetDistance
+  }
+}
+
+function resampleRouteProfile(
+  graph,
+  path
+) {
+  const {
+    points,
+    totalDistance
+  } =
+    makeOrderedPathPoints(
+      graph,
+      path
     )
-    .filter(Boolean)
+
+  if (
+    points.length < 2 ||
+    totalDistance <= 0
+  ) {
+    return {
+      samples: points,
+      totalDistance,
+      sampleSpacingMeters:
+        totalDistance
+    }
+  }
+
+  // Use an integer number of equal-length segments.
+  // For normal walking routes this gives roughly 20–30 m per sample.
+  const segmentCount =
+    Math.max(
+      1,
+      Math.round(
+        totalDistance /
+        GRADE_SAMPLE_DISTANCE_METERS
+      )
+    )
+
+  const sampleSpacingMeters =
+    totalDistance /
+    segmentCount
+
+  const samples = []
+
+  let sourceIndex = 0
+
+  for (
+    let sampleIndex = 0;
+    sampleIndex <=
+      segmentCount;
+    sampleIndex++
+  ) {
+    const targetDistance =
+      sampleIndex ===
+      segmentCount
+        ? totalDistance
+        : sampleIndex *
+          sampleSpacingMeters
+
+    while (
+      sourceIndex <
+        points.length - 2 &&
+      points[
+        sourceIndex + 1
+      ].distanceAlong <
+        targetDistance
+    ) {
+      sourceIndex++
+    }
+
+    const first =
+      points[
+        sourceIndex
+      ]
+
+    const second =
+      points[
+        Math.min(
+          sourceIndex + 1,
+          points.length - 1
+        )
+      ]
+
+    samples.push(
+      interpolateProfilePoint(
+        first,
+        second,
+        targetDistance
+      )
+    )
+  }
+
+  return {
+    samples,
+    totalDistance,
+    sampleSpacingMeters
+  }
 }
 
 // ============================================================
-// ROUTE
+// ROUTE-SPECIFIC ELEVATION SMOOTHING
+// ============================================================
+
+function smoothRouteSamples(
+  samples
+) {
+  if (
+    samples.length < 3
+  ) {
+    return samples.map(
+      sample => ({
+        ...sample,
+
+        smoothedElevation:
+          sample.elevation
+      })
+    )
+  }
+
+  return samples.map(
+    (
+      sample,
+      index
+    ) => {
+      let weightedElevation = 0
+      let totalWeight = 0
+
+      for (
+        let offset = -1;
+        offset <= 1;
+        offset++
+      ) {
+        const neighborIndex =
+          index + offset
+
+        if (
+          neighborIndex < 0 ||
+          neighborIndex >=
+            samples.length
+        ) {
+          continue
+        }
+
+        const neighbor =
+          samples[
+            neighborIndex
+          ]
+
+        const weight =
+          offset === 0
+            ? 2
+            : 1
+
+        weightedElevation +=
+          neighbor.elevation *
+          weight
+
+        totalWeight +=
+          weight
+      }
+
+      return {
+        ...sample,
+
+        smoothedElevation:
+          weightedElevation /
+          totalWeight
+      }
+    }
+  )
+}
+
+// ============================================================
+// FINAL ROUTE METRICS
+// ============================================================
+
+function calculateRouteMetrics(
+  graph,
+  path
+) {
+  const {
+    samples,
+    totalDistance,
+    sampleSpacingMeters
+  } =
+    resampleRouteProfile(
+      graph,
+      path
+    )
+
+  const smoothedSamples =
+    smoothRouteSamples(
+      samples
+    )
+
+  let totalAscent = 0
+
+  let weightedAbsoluteGrade = 0
+
+  let maximumGrade = 0
+
+  let totalEnergyPerKgJ = 0
+
+  for (
+    let index = 1;
+    index <
+      smoothedSamples.length;
+    index++
+  ) {
+    const first =
+      smoothedSamples[
+        index - 1
+      ]
+
+    const second =
+      smoothedSamples[
+        index
+      ]
+
+    const horizontalDistance =
+      second.distanceAlong -
+      first.distanceAlong
+
+    if (
+      horizontalDistance <= 0
+    ) {
+      continue
+    }
+
+    const elevationChange =
+      second.smoothedElevation -
+      first.smoothedElevation
+
+    if (
+      elevationChange > 0
+    ) {
+      totalAscent +=
+        elevationChange
+    }
+
+    const grade =
+      clamp(
+        elevationChange /
+          horizontalDistance,
+        -MAX_MODEL_GRADE,
+        MAX_MODEL_GRADE
+      )
+
+    weightedAbsoluteGrade +=
+      Math.abs(
+        grade
+      ) *
+      horizontalDistance
+
+    maximumGrade =
+      Math.max(
+        maximumGrade,
+        Math.abs(
+          grade
+        )
+      )
+
+    totalEnergyPerKgJ +=
+      walkingEnergyCost(
+        grade
+      ) *
+      horizontalDistance
+  }
+
+  const averageGrade =
+    totalDistance > 0
+      ? weightedAbsoluteGrade /
+        totalDistance
+      : 0
+
+  const flatEnergyPerKgJ =
+    FLAT_WALKING_COST *
+    totalDistance
+
+  const effortRatio =
+    flatEnergyPerKgJ > 0
+      ? totalEnergyPerKgJ /
+        flatEnergyPerKgJ
+      : 1
+
+  return {
+    totalDistance,
+    totalAscent,
+    averageGrade,
+    maximumGrade,
+    totalEnergyPerKgJ,
+    effortRatio,
+    sampleSpacingMeters,
+    sampleCount:
+      smoothedSamples.length
+  }
+}
+
+// ============================================================
+// ROUTE RESULT
+// ============================================================
+
+function makeRouteResult(
+  graph,
+  path,
+  mode,
+  visitedNodes
+) {
+  const coordinates =
+    path
+      .map(
+        nodeId => {
+          const node =
+            graph.nodes.get(
+              nodeId
+            )
+
+          if (!node) {
+            return null
+          }
+
+          return [
+            node.lon,
+            node.lat
+          ]
+        }
+      )
+      .filter(Boolean)
+
+  const metrics =
+    calculateRouteMetrics(
+      graph,
+      path
+    )
+
+  const distanceMiles =
+    metrics.totalDistance /
+    METERS_PER_MILE
+
+  const minutes =
+    metrics.totalDistance /
+    WALKING_SPEED_METERS_PER_SECOND /
+    60
+
+  const labels = {
+    shortest:
+      'Shortest',
+
+    balanced:
+      'Balanced',
+
+    energy:
+      'Less Energy'
+  }
+
+  return {
+    id:
+      mode,
+
+    label:
+      labels[mode],
+
+    algorithm:
+      'A*',
+
+    // Keep the full precision in the API.
+    distanceMeters:
+      metrics.totalDistance,
+
+    distanceMiles,
+
+    minutes,
+
+    totalAscentMeters:
+      metrics.totalAscent,
+
+    averageGradePercent:
+      metrics.averageGrade *
+      100,
+
+    maximumGradePercent:
+      metrics.maximumGrade *
+      100,
+
+    energyKJPerKg:
+      metrics.totalEnergyPerKgJ /
+      1000,
+
+    effortRatio:
+      metrics.effortRatio,
+
+    gradeSampleSpacingMeters:
+      metrics.sampleSpacingMeters,
+
+    gradeSampleCount:
+      metrics.sampleCount,
+
+    visitedNodes,
+
+    graphNodes:
+      graph.nodes.size,
+
+    coordinates,
+
+    pathFingerprint:
+      path.join('-')
+  }
+}
+
+// ============================================================
+// ROUTE API
 // ============================================================
 
 app.post(
@@ -1508,7 +2879,7 @@ app.post(
     request,
     response
   ) => {
-    const totalStart =
+    const totalStarted =
       Date.now()
 
     try {
@@ -1592,25 +2963,19 @@ app.post(
         1100
       ]
 
-      let foundGraph =
-        false
-
-      let lastPathProblem =
+      let lastError =
         'No connected walking route found.'
 
       for (
         const paddingMeters
         of paddingOptions
       ) {
-        console.log('')
-        console.log(
-          'ROUTE ATTEMPT:',
-          `${paddingMeters} m padding`
-        )
-
-        let graph
-
         try {
+          console.log('')
+          console.log(
+            `ROUTE ATTEMPT: ${paddingMeters} m`
+          )
+
           const bounds =
             makeBounds(
               start,
@@ -1618,203 +2983,243 @@ app.post(
               paddingMeters
             )
 
-          graph =
+          const graph =
             await getWalkingGraph(
               bounds
             )
 
-          foundGraph =
-            true
+          if (
+            graph.adjacency.size ===
+            0
+          ) {
+            continue
+          }
+
+          const nearestStart =
+            findNearestNode(
+              graph,
+              start
+            )
+
+          const nearestEnd =
+            findNearestNode(
+              graph,
+              end
+            )
+
+          if (
+            nearestStart.nodeId ===
+              null ||
+            nearestEnd.nodeId ===
+              null
+          ) {
+            continue
+          }
+
+          const modes = [
+            'shortest',
+            'balanced',
+            'energy'
+          ]
+
+          const routes = []
+
+          let failed =
+            false
+
+          for (
+            const mode
+            of modes
+          ) {
+            const algorithmStarted =
+              performance.now()
+
+            const result =
+              aStar(
+                graph,
+                nearestStart.nodeId,
+                nearestEnd.nodeId,
+                mode
+              )
+
+            console.log(
+              `${mode} A*:`,
+              `${(
+                performance.now() -
+                algorithmStarted
+              ).toFixed(2)} ms`
+            )
+
+            if (!result) {
+              failed =
+                true
+
+              break
+            }
+
+            routes.push(
+              makeRouteResult(
+                graph,
+                result.path,
+                mode,
+                result.visitedNodes
+              )
+            )
+          }
+
+          if (failed) {
+            lastError =
+              `Could not calculate all routes with ${paddingMeters} m padding.`
+
+            continue
+          }
+
+          // Detect identical paths.
+          for (
+            let index = 0;
+            index <
+              routes.length;
+            index++
+          ) {
+            for (
+              let compare = 0;
+              compare <
+                index;
+              compare++
+            ) {
+              if (
+                routes[index]
+                  .pathFingerprint ===
+                routes[compare]
+                  .pathFingerprint
+              ) {
+                routes[index]
+                  .samePathAs =
+                  routes[
+                    compare
+                  ].id
+
+                break
+              }
+            }
+          }
+
+          for (
+            const route
+            of routes
+          ) {
+            delete route
+              .pathFingerprint
+          }
+
+          console.log('')
+          console.log(
+            '=== COMFORT WALK ROUTE METRICS ==='
+          )
+
+          console.table(
+            routes.map(
+              route => ({
+                Route:
+                  route.label,
+
+                'Distance m':
+                  route
+                    .distanceMeters
+                    .toFixed(2),
+
+                'Distance mi':
+                  route
+                    .distanceMiles
+                    .toFixed(5),
+
+                'Ascent m':
+                  route
+                    .totalAscentMeters
+                    .toFixed(2),
+
+                'Avg grade %':
+                  route
+                    .averageGradePercent
+                    .toFixed(3),
+
+                'Max grade %':
+                  route
+                    .maximumGradePercent
+                    .toFixed(3),
+
+                'Energy kJ/kg':
+                  route
+                    .energyKJPerKg
+                    .toFixed(4),
+
+                'Flat effort':
+                  route
+                    .effortRatio
+                    .toFixed(4),
+
+                'Grade spacing m':
+                  route
+                    .gradeSampleSpacingMeters
+                    .toFixed(2),
+
+                Samples:
+                  route
+                    .gradeSampleCount
+              })
+            )
+          )
+
+          console.log(
+            'Total route request:',
+            `${Date.now() - totalStarted} ms`
+          )
+
+          return response.json({
+            routes,
+
+            paddingMeters,
+
+            elevationCoverage:
+              graph.elevationCoverage *
+              100,
+
+            elevationSource:
+              'Terrain Tiles',
+
+            elevationSmoothingRadiusMeters:
+              GRAPH_ELEVATION_SMOOTH_RADIUS_METERS,
+
+            targetGradeSampleDistanceMeters:
+              GRADE_SAMPLE_DISTANCE_METERS,
+
+            routingEngine:
+              'Custom A*'
+          })
         } catch (
           error
         ) {
-          console.error(
-            'Graph download failed:',
+          console.log(
+            'Route attempt failed:',
             error.message
           )
 
-          continue
+          lastError =
+            error.message
         }
-
-        if (
-          graph.adjacency.size ===
-          0
-        ) {
-          lastPathProblem =
-            'Walking graph was empty.'
-
-          continue
-        }
-
-        const nearestStart =
-          findNearestNode(
-            graph,
-            start
-          )
-
-        const nearestEnd =
-          findNearestNode(
-            graph,
-            end
-          )
-
-        if (
-          nearestStart.nodeId ===
-            null ||
-          nearestEnd.nodeId ===
-            null
-        ) {
-          lastPathProblem =
-            'Could not connect the locations to the street network.'
-
-          continue
-        }
-
-        const algorithmStart =
-          performance.now()
-
-        const result =
-          aStar(
-            graph,
-            nearestStart.nodeId,
-            nearestEnd.nodeId
-          )
-
-        console.log(
-          'A* time:',
-          Math.round(
-            performance.now() -
-            algorithmStart
-          ),
-          'ms'
-        )
-
-        if (!result) {
-          lastPathProblem =
-            `No connected path with ${paddingMeters} m padding.`
-
-          continue
-        }
-
-        const coordinates =
-          pathToCoordinates(
-            graph,
-            result.path
-          )
-
-        if (
-          coordinates.length <
-          2
-        ) {
-          lastPathProblem =
-            'Route geometry was empty.'
-
-          continue
-        }
-
-        const miles =
-          result.distance /
-          METERS_PER_MILE
-
-        const minutes =
-          result.distance /
-          WALKING_SPEED_METERS_PER_SECOND /
-          60
-
-        console.log(
-          'ROUTE SUCCESS'
-        )
-
-        console.log(
-          'Distance:',
-          Math.round(
-            result.distance
-          ),
-          'm'
-        )
-
-        console.log(
-          'Coordinates:',
-          coordinates.length
-        )
-
-        console.log(
-          'Total time:',
-          Date.now() -
-            totalStart,
-          'ms'
-        )
-
-        return response.json({
-          algorithm:
-            'A*',
-
-          cost:
-            'distance',
-
-          paddingMeters,
-
-          distanceMeters:
-            Math.round(
-              result.distance
-            ),
-
-          distanceMiles:
-            Math.round(
-              miles *
-              100
-            ) /
-            100,
-
-          minutes:
-            Math.round(
-              minutes *
-              10
-            ) /
-            10,
-
-          visitedNodes:
-            result.visitedNodes,
-
-          graphNodes:
-            graph.nodes.size,
-
-          snappedStartMeters:
-            Math.round(
-              nearestStart.distance
-            ),
-
-          snappedEndMeters:
-            Math.round(
-              nearestEnd.distance
-            ),
-
-          coordinates
-        })
-      }
-
-      if (
-        !foundGraph
-      ) {
-        return response
-          .status(502)
-          .json({
-            error:
-              'OpenStreetMap road data could not be downloaded.'
-          })
       }
 
       return response
         .status(404)
         .json({
           error:
-            lastPathProblem
+            lastError
         })
     } catch (
       error
     ) {
       console.error(
-        'ROUTE SERVER ERROR:',
+        'ROUTE ERROR:',
         error
       )
 
@@ -1846,11 +3251,23 @@ app.get(
       routing:
         'custom-a-star',
 
-      search:
-        'photon',
+      routeModes: [
+        'shortest',
+        'balanced',
+        'energy'
+      ],
 
-      overpassMirrors:
-        OVERPASS_SERVERS.length
+      elevation:
+        'terrain-tiles',
+
+      graphElevationSmoothingMeters:
+        GRAPH_ELEVATION_SMOOTH_RADIUS_METERS,
+
+      gradeSampleTargetMeters:
+        GRADE_SAMPLE_DISTANCE_METERS,
+
+      search:
+        'photon'
     })
   }
 )
@@ -1867,19 +3284,29 @@ app.listen(
     console.log(
       'Comfort Walk server'
     )
+
     console.log(
       `http://127.0.0.1:${PORT}`
     )
+
     console.log('')
+
     console.log(
       'Routing: custom A*'
     )
+
     console.log(
-      'OSM query: bounding box'
+      'Modes: Shortest / Balanced / Less Energy'
     )
+
     console.log(
-      'Overpass User-Agent: ON'
+      `Elevation smoothing: ${GRAPH_ELEVATION_SMOOTH_RADIUS_METERS} m`
     )
+
+    console.log(
+      `Grade sampling target: ${GRADE_SAMPLE_DISTANCE_METERS} m`
+    )
+
     console.log('')
   }
 )
