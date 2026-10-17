@@ -76,3 +76,5 @@ dist-ssr
 *.sln
 *.sw?
 .DS_Store
+server/canopy-cache.geojson
+server/.osm-cache/

@@ -1,0 +1,11 @@
+# Used by `gcloud run deploy --source .` (it would otherwise follow .gitignore).
+# server/canopy-raster.bin (small) is intentionally NOT ignored, so it ships
+# in the container. The huge raw canopy-cache.geojson is left out.
+.git
+.gitignore
+node_modules/
+server/node_modules/
+dist/
+server/.osm-cache/
+server/canopy-cache.geojson
+.DS_Store
