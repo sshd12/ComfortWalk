@@ -1341,7 +1341,7 @@ button,
     width: calc(100% - 16px);
     max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 90px);
     max-height: min(
-      68dvh,
+      46dvh,
       calc(100dvh - env(safe-area-inset-top, 0px) - 90px)
     );
     padding: 8px 8px 0;
@@ -1594,11 +1594,6 @@ button,
   background: rgba(179, 38, 30, 0.12);
 }
 
-.route-option-effort {
-  margin-top: 2px;
-  font-size: 11px;
-  font-weight: 700;
-}
 
 .route-same {
   display: flex;
@@ -1712,7 +1707,7 @@ button,
   position: fixed;
   z-index: 45;
   right: 12px;
-  top: calc(env(safe-area-inset-top, 0px) + 72px);
+  top: calc(env(safe-area-inset-top, 0px) + 126px);
   width: 40px;
   height: 40px;
   border: 0;
@@ -1751,8 +1746,7 @@ button,
     font-size: 12px;
   }
 
-  .effort-badge,
-  .route-option-effort {
+  .effort-badge {
     font-size: 11px;
   }
 
@@ -1760,4 +1754,371 @@ button,
     padding: 16px 16px 14px;
     font-size: 14px;
   }
+}
+
+
+/* ============================================================
+   DESKTOP: keep the route sheet short so the map stays visible
+   ============================================================ */
+
+@media (min-width: 601px) {
+  .route-sheet {
+    max-height: min(calc(100dvh - 120px), 560px);
+  }
+
+  /* Start stays reachable while the sheet scrolls. */
+  .route-sheet:not(.route-sheet-collapsed) > .start-button {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    box-shadow: 0 -8px 12px -2px rgba(255, 255, 255, 0.97);
+  }
+}
+
+
+/* ============================================================
+   WIDE SCREENS: route sheet becomes a panel on the left so it
+   never covers the route on the map.
+   (Keep 900px and 420px in sync with SIDE_PANEL_* in App.jsx.)
+   ============================================================ */
+
+@media (min-width: 900px) {
+  .route-sheet {
+    left: 16px;
+    top: 88px;
+    bottom: 16px;
+    transform: none;
+    width: 420px;
+    max-height: none;
+  }
+
+  /* Collapsed: a compact bar in the bottom-left corner. */
+  .route-sheet-collapsed {
+    top: auto;
+  }
+}
+
+
+/* ============================================================
+   STEP-FREE (WHEELCHAIR / STROLLER) MODE
+   ============================================================ */
+
+.access-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 12px;
+  background: #f1f2f4;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.access-switch-label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.access-switch-label small {
+  color: #6b6f76;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.access-switch-knob {
+  position: relative;
+  flex: none;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: #c4c8ce;
+  transition: background 0.15s;
+}
+
+.access-switch-knob::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+
+.access-switch-on {
+  background: rgba(8, 123, 255, 0.1);
+}
+
+.access-switch-on .access-switch-knob {
+  background: #087bff;
+}
+
+.access-switch-on .access-switch-knob::after {
+  transform: translateX(18px);
+}
+
+.access-note {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: #eef6ff;
+  color: #1b4f8a;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.access-note strong {
+  font-size: 13px;
+}
+
+.access-note small {
+  color: #5a7490;
+  font-size: 11px;
+}
+
+.access-note-warn {
+  background: #fff4e5;
+  color: #8a4b00;
+}
+
+.access-note-warn small {
+  color: #8f6a3f;
+}
+
+@media (max-width: 600px) {
+  .access-switch {
+    min-height: 48px;
+    padding: 8px 12px;
+  }
+
+  .access-switch-label {
+    font-size: 14px;
+  }
+
+  .access-note {
+    font-size: 12px;
+  }
+}
+
+
+/* No-route card for step-free mode (it is the same sheet, but short). */
+.route-sheet.route-sheet-empty {
+  top: auto;
+  padding-bottom: 8px;
+}
+
+.route-empty-message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff4e5;
+  color: #8a4b00;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.route-empty-message strong {
+  font-size: 13px;
+}
+
+
+/* ---- Comfort summary + intro tabs ---- */
+
+.route-summary {
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.35;
+  color: #1f7a3d;
+}
+
+.intro-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0 10px;
+  padding: 3px;
+  border-radius: 12px;
+  background: #f1f3f4;
+}
+
+.intro-tab {
+  flex: 1;
+  height: 34px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #5f6368;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.intro-tab-active {
+  background: #fff;
+  color: #087bff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.intro-body h3:first-child {
+  margin-top: 0;
+}
+
+.intro-formula {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f1f3f4;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.intro-live {
+  font-size: 13px;
+}
+
+.intro-sources {
+  list-style: none;
+  padding-left: 0 !important;
+}
+
+.intro-sources li {
+  margin-bottom: 10px;
+}
+
+.data-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.data-badge-real {
+  background: #e3f4e8;
+  color: #1f7a3d;
+}
+
+.data-badge-limited {
+  background: #fdebd9;
+  color: #b3541e;
+}
+
+
+/* ---- Start point field ---- */
+
+.search-bar-start {
+  height: 44px;
+  margin-top: 6px;
+}
+
+.search-bar-start input {
+  font-size: 15px;
+}
+
+.start-dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin: 0 12px 0 7px;
+  border-radius: 50%;
+  background: #34c759;
+  box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.25);
+}
+
+@media (max-width: 600px) {
+  .search-bar-start {
+    height: 42px;
+    border-radius: 15px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+  }
+
+  .search-bar-start input {
+    font-size: 16px;
+  }
+}
+
+
+/* ---- Location warning ---- */
+
+.location-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 10px 6px 10px 12px;
+  border-radius: 14px;
+  background: #fff4e5;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+  color: #7a4300;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.location-warning-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.location-warning-close {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: #7a4300;
+  font-size: 20px;
+  cursor: pointer;
+}
+
+
+/* ---- Same size for both fields, matching icons ---- */
+
+.search-bar,
+.search-bar-start {
+  height: 52px;
+  border-radius: 17px;
+}
+
+.search-bar-start {
+  margin-top: 8px;
+}
+
+.search-bar input,
+.search-bar-start input {
+  font-size: 16px;
+}
+
+.search-icon {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 0 10px 0 0;
+}
+
+.search-icon svg {
+  display: block;
 }

@@ -72,7 +72,7 @@ const CANOPY_COMFORT_STRENGTH = 0.25
 // ---- Comfort route preferences (set by the sliders, each 0 to 1) ----
 // Defaults: hills 0.5 -> 70% hill effort / 30% distance (see makeComfortWeights),
 //   shade 0.5 -> strength 0.25, crossings 0 -> crosswalks are not penalised.
-const DEFAULT_PREFERENCES = { shade: 0.5, hills: 0.5, crossings: 0 }
+const DEFAULT_PREFERENCES = { shade: 0.5, hills: 0.5, crossings: 0, accessible: false }
 const MAX_CANOPY_COMFORT_STRENGTH = 0.5
 // Hill share of the comfort cost at the default slider (hills = 0.5).
 // hillWeight = HILL_WEIGHT_MIN + HILL_WEIGHT_RANGE * hills -> 0.4 .. 1.0
@@ -128,8 +128,86 @@ function normalizePreferences(raw) {
   return {
     shade: read(raw?.shade, DEFAULT_PREFERENCES.shade),
     hills: read(raw?.hills, DEFAULT_PREFERENCES.hills),
-    crossings: read(raw?.crossings, DEFAULT_PREFERENCES.crossings)
+    crossings: read(raw?.crossings, DEFAULT_PREFERENCES.crossings),
+    accessible: raw?.accessible === true
   }
+}
+
+// ---- Wheelchair / stroller mode ----
+// Steps (without a mapped ramp) and ways tagged wheelchair=no are removed
+// from the graph for every route. The Comfort route also pays extra for
+// steep and rough stretches. 8.3% (1:12) is the usual maximum ramp slope;
+// 5% is where wheelchair users start to find a slope tiring.
+const ACCESSIBLE_COMFORT_GRADE = 0.05
+const ACCESSIBLE_MAX_GRADE = 0.083
+const ACCESSIBLE_MAX_MULTIPLIER = 8
+const ROUGH_SURFACES = new Set([
+  'unpaved',
+  'dirt',
+  'gravel',
+  'fine_gravel',
+  'ground',
+  'grass',
+  'sand',
+  'mud',
+  'earth',
+  'pebblestone',
+  'cobblestone',
+  'sett',
+  'unhewn_cobblestone',
+  'compacted'
+])
+
+function isBlockedForWheels(edge) {
+  if (edge.wheelchair === 'no') {
+    return true
+  }
+
+  return edge.highway === 'steps' && !edge.hasRamp
+}
+
+// Returns a graph view without the edges a wheelchair or stroller cannot use.
+function makeStepFreeGraph(graph) {
+  const adjacency = new Map()
+
+  for (const [fromId, edges] of graph.adjacency) {
+    const passable = edges.filter(
+      edge => !isBlockedForWheels(edge)
+    )
+
+    if (passable.length > 0) {
+      adjacency.set(fromId, passable)
+    }
+  }
+
+  return { ...graph, adjacency }
+}
+
+// Cost multiplier (1 = no extra cost) for steep, rough or limited ways.
+function getAccessibilityMultiplier(edge, grade) {
+  const steepness = Math.abs(grade)
+
+  let multiplier = 1
+
+  if (steepness > ACCESSIBLE_MAX_GRADE) {
+    multiplier =
+      2 + (steepness - ACCESSIBLE_MAX_GRADE) * 40
+  } else if (steepness > ACCESSIBLE_COMFORT_GRADE) {
+    multiplier =
+      1 +
+      (steepness - ACCESSIBLE_COMFORT_GRADE) /
+        (ACCESSIBLE_MAX_GRADE - ACCESSIBLE_COMFORT_GRADE)
+  }
+
+  if (ROUGH_SURFACES.has(edge.surface)) {
+    multiplier *= 1.6
+  }
+
+  if (edge.wheelchair === 'limited') {
+    multiplier *= 1.5
+  }
+
+  return Math.min(ACCESSIBLE_MAX_MULTIPLIER, multiplier)
 }
 
 function makeComfortWeights(preferences, easing = null) {
@@ -166,6 +244,7 @@ function makeComfortWeights(preferences, easing = null) {
   )
 
   return {
+    accessible: preferences.accessible === true,
     distance: 1 - hillWeight,
     hill: hillWeight,
     shade: shadeStrength,
@@ -182,7 +261,8 @@ function getComfortLimits(preferences, shortestRoute) {
     shortestRoute.distanceMeters *
     (1 +
       GUARD_DISTANCE_BASE +
-      GUARD_DISTANCE_PER_SHADE * preferences.shade)
+      GUARD_DISTANCE_PER_SHADE * preferences.shade +
+      (preferences.accessible ? 0.25 : 0))
 
   const maxClimb =
     shortestRoute.totalAscentMeters *
@@ -971,6 +1051,41 @@ function edgeCanopyRatio(first, second, distance, index) {
   return covered / sampleCount
 }
 
+// The tree canopy dataset only covers San Francisco. Outside it every edge
+// would read 0%, which looks like "no trees" rather than "no data".
+const CANOPY_COVERAGE_BOUNDS = {
+  south: 37.69,
+  north: 37.84,
+  west: -122.53,
+  east: -122.34
+}
+
+function isGraphInCanopyCoverage(graph) {
+  let latSum = 0
+  let lonSum = 0
+  let count = 0
+
+  for (const node of graph.nodes.values()) {
+    latSum += node.lat
+    lonSum += node.lon
+    count++
+  }
+
+  if (count === 0) {
+    return false
+  }
+
+  const lat = latSum / count
+  const lon = lonSum / count
+
+  return (
+    lat >= CANOPY_COVERAGE_BOUNDS.south &&
+    lat <= CANOPY_COVERAGE_BOUNDS.north &&
+    lon >= CANOPY_COVERAGE_BOUNDS.west &&
+    lon <= CANOPY_COVERAGE_BOUNDS.east
+  )
+}
+
 async function populateGraphCanopy(graph) {
   // Don't hammer the dataset host if it just failed.
   if (
@@ -1023,6 +1138,7 @@ async function populateGraphCanopy(graph) {
 
   graph.canopyAvailable = true
   graph.canopyCoverage = totalDistance > 0 ? coveredDistance / totalDistance : 0
+  graph.canopyCovered = isGraphInCanopyCoverage(graph)
 
   console.log(
     `Tree canopy: ${(graph.canopyCoverage * 100).toFixed(1)}% of walkable distance is under canopy`
@@ -1145,11 +1261,17 @@ function getEdgeCost(
       )
 
     const base =
-      w.distance *
+      (w.distance *
         edge.distance +
       w.hill *
         profile
-          .flatEquivalentMeters
+          .flatEquivalentMeters) *
+      (w.accessible
+        ? getAccessibilityMultiplier(
+            edge,
+            profile.grade
+          )
+        : 1)
 
     return (
       base *
@@ -2061,6 +2183,27 @@ function buildGraph(
 
         wayId:
           way.id,
+
+        // Tags used by wheelchair / stroller mode.
+        surface:
+          way.tags
+            ?.surface ||
+          '',
+
+        wheelchair:
+          way.tags
+            ?.wheelchair ||
+          '',
+
+        hasRamp:
+          way.tags?.ramp ===
+            'yes' ||
+          way.tags?.[
+            'ramp:wheelchair'
+          ] === 'yes' ||
+          way.tags?.[
+            'ramp:stroller'
+          ] === 'yes',
 
         // Marked crosswalks are mapped as separate footway=crossing ways.
         isCrossing:
@@ -3259,6 +3402,44 @@ function findCrosswalks(
   }
 
   return crossings
+}
+
+function calculateSteepOverLimitMeters(
+  graph,
+  path
+) {
+  let total = 0
+
+  for (
+    let index = 0;
+    index < path.length - 1;
+    index++
+  ) {
+    const edge = getPathEdge(
+      graph,
+      path[index],
+      path[index + 1]
+    )
+
+    if (!edge) {
+      continue
+    }
+
+    const profile = getEdgeProfile(
+      graph,
+      path[index],
+      edge
+    )
+
+    if (
+      Math.abs(profile.grade) >
+      ACCESSIBLE_MAX_GRADE
+    ) {
+      total += edge.distance
+    }
+  }
+
+  return total
 }
 
 function calculateRouteCanopy(
@@ -4678,7 +4859,8 @@ function makeRouteResult(
         .coveredDistanceMeters,
 
     canopyDataAvailable:
-      graph.canopyAvailable,
+      graph.canopyAvailable &&
+      graph.canopyCovered !== false,
 
     flatEquivalentMeters:
       routingEnergy
@@ -4703,6 +4885,13 @@ function makeRouteResult(
 
     maneuvers:
       buildManeuvers(
+        graph,
+        path
+      ),
+
+    // Length of the route steeper than the usual 8.3% ramp limit.
+    steepOverLimitMeters:
+      calculateSteepOverLimitMeters(
         graph,
         path
       ),
@@ -4815,7 +5004,9 @@ app.post(
       ]
 
       let lastError =
-        'No route found.'
+        preferences.accessible
+          ? 'No step-free route found.'
+          : 'No route found.'
 
       for (
         const paddingMeters
@@ -4829,10 +5020,18 @@ app.post(
               paddingMeters
             )
 
-          const graph =
+          const fullGraph =
             await getWalkingGraph(
               bounds
             )
+
+          // Wheelchair / stroller mode: no steps for any of the routes.
+          const graph =
+            preferences.accessible
+              ? makeStepFreeGraph(
+                  fullGraph
+                )
+              : fullGraph
 
           const nearestStart =
             findNearestNode(
@@ -5029,7 +5228,8 @@ app.post(
               100,
 
             canopyDataAvailable:
-              graph.canopyAvailable,
+              graph.canopyAvailable &&
+              graph.canopyCovered !== false,
 
             routingEngine:
               'Custom A*',
